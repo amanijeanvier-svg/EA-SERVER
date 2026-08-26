@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EA — Admin abonnements</title>
+<style>
+  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif; background:#0b0d13; color:#eee; margin:0; padding:20px;}
+  h1{font-size:18px; margin-bottom:4px;}
+  .sub{color:#888; font-size:12px; margin-bottom:20px;}
+  input,select,button{font-size:14px; padding:8px 10px; border-radius:8px; border:1px solid #333; background:#151822; color:#eee;}
+  button{background:#e0b25a; color:#111; border:none; cursor:pointer; font-weight:600;}
+  button:hover{opacity:.9;}
+  .row{display:flex; gap:8px; margin-bottom:16px; flex-wrap:wrap; align-items:center;}
+  table{width:100%; border-collapse:collapse; margin-top:10px;}
+  th,td{text-align:left; padding:8px 6px; border-bottom:1px solid #222; font-size:13px;}
+  th{color:#999; font-weight:500; text-transform:uppercase; font-size:10px; letter-spacing:.05em;}
+  .status-active{color:#4dd0a8;}
+  .status-trial{color:#e0b25a;}
+  .status-expired{color:#e05a5a;}
+  .msg{font-size:12px; margin-top:8px;}
+  .card{background:#12141c; border:1px solid #222; border-radius:12px; padding:16px; margin-bottom:16px;}
+</style>
+</head>
+<body>
+  <h1>EA — Panneau d'admin</h1>
+  <div class="sub">Active un abonnement après avoir vérifié la réception du paiement dans ton appli Wave.</div>
+  <div class="sub">Formules & tarifs en vigueur — Wave : <b style="color:#e0b25a;">+225 07 69 50 43 04</b></div>
+  <table style="width:auto; margin-bottom:6px;">
+    <thead><tr><th></th><th>Mensuel</th><th>6 mois</th><th>Annuel</th></tr></thead>
+    <tbody>
+      <tr><td style="color:#e0b25a;">Dossier Simple</td><td>1 500 F</td><td>7 500 F</td><td>13 500 F</td></tr>
+      <tr><td style="color:#e0b25a;">Dossier Complet</td><td>2 500 F</td><td>12 500 F</td><td>22 500 F</td></tr>
+      <tr><td style="color:#e0b25a;">Cabinet Privé</td><td>4 000 F</td><td>20 000 F</td><td>36 000 F</td></tr>
+    </tbody>
+  </table>
+  <div class="sub">Essai gratuit : <b style="color:#e0b25a;">7 jours</b> (accès complet aux 2 disciplines pendant l'essai)</div>
+
+  <div class="card">
+    <div class="row">
+      <input type="password" id="adminPw" placeholder="Mot de passe admin" style="flex:1; min-width:180px;">
+      <button id="loadBtn">Charger la liste</button>
+    </div>
+    <div class="msg" id="loadMsg"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input type="text" id="actPhone" placeholder="Numéro (ex: +221771234567)">
+      <select id="actFormula">
+        <option value="simple">Dossier Simple</option>
+        <option value="complet" selected>Dossier Complet</option>
+        <option value="prive">Cabinet Privé</option>
+      </select>
+      <select id="actSport" class="hidden" style="display:none;">
+        <option value="ge">⚽ Football</option>
+        <option value="bk">🏀 Basketball</option>
+      </select>
+      <select id="actPlan">
+        <option value="monthly">Mensuel</option>
+        <option value="semestrial">6 mois</option>
+        <option value="annual">Annuel</option>
+      </select>
+      <button id="activateBtn">Activer / prolonger</button>
+    </div>
+    <div class="msg" id="actMsg">Astuce : clique directement sur "⚡ Activer cette demande" dans le tableau ci-dessous — les champs se remplissent tout seuls avec exactement ce que le client a choisi.</div>
+  </div>
+
+  <table id="userTable" style="display:none;">
+    <thead><tr><th>Téléphone</th><th>Nom</th><th>Formule</th><th>Statut</th><th>Expire le</th><th>Inscrit le</th><th>Demande en attente</th></tr></thead>
+    <tbody id="userTbody"></tbody>
+  </table>
+
+<script>
+function fmtDate(ms){ return ms ? new Date(ms).toLocaleString('fr-FR') : '—'; }
+const FORMULA_LABELS = {simple:'Dossier Simple', complet:'Dossier Complet', prive:'Cabinet Privé'};
+const PLAN_LABELS = {monthly:'Mensuel', semestrial:'6 mois', annual:'Annuel'};
+function formulaLabel(s){
+  const lbl = FORMULA_LABELS[s.formula] || 'Dossier Complet';
+  const sportSuffix = s.formula==='simple' ? (s.sport==='bk' ? ' (Basket)' : ' (Football)') : '';
+  return lbl + sportSuffix;
+}
+function statusLabel(s){
+  const planLabels = {monthly:'mensuel', semestrial:'6 mois', annual:'annuel'};
+  if(s.status==='active') return `<span class="status-active">✓ Actif (${planLabels[s.plan]||s.plan})</span>`;
+  if(s.status==='trial') return `<span class="status-trial">Essai en cours</span>`;
+  return `<span class="status-expired">✗ Expiré</span>`;
+}
+function pendingLabel(u){
+  const pr = u.pendingRequest;
+  if(!pr) return '<span style="color:#555;">—</span>';
+  const lbl = formulaLabel(pr) + ' · ' + (PLAN_LABELS[pr.plan]||pr.plan);
+  return `<span style="color:#e0b25a; font-weight:600;">⏳ ${lbl}</span><br>
+    <span style="font-size:10px; color:#888;">demandé le ${fmtDate(pr.requestedAt)}</span><br>
+    <button class="fillActivateBtn" data-phone="${u.phone}" data-formula="${pr.formula}" data-sport="${pr.sport||''}" data-plan="${pr.plan}" style="margin-top:4px; font-size:11px; padding:5px 8px;">⚡ Activer cette demande</button>`;
+}
+document.getElementById('actFormula').addEventListener('change', (e)=>{
+  document.getElementById('actSport').style.display = e.target.value==='simple' ? '' : 'none';
+});
+async function loadUsers(){
+  const pw = document.getElementById('adminPw').value;
+  const msgEl = document.getElementById('loadMsg');
+  msgEl.textContent = 'Chargement...';
+  try{
+    const r = await fetch('/api/admin/users', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({adminPassword: pw})
+    });
+    const data = await r.json();
+    if(!r.ok){ msgEl.textContent = '✗ ' + (data.error||'Erreur'); return; }
+    const pendingCount = data.users.filter(u=>u.pendingRequest).length;
+    msgEl.textContent = `${data.users.length} utilisateur(s)${pendingCount ? ` — ${pendingCount} demande(s) en attente ⏳` : ''}.`;
+    const tbody = document.getElementById('userTbody');
+    // Les comptes avec une demande en attente remontent en premier — ce sont ceux qui attendent une action.
+    const sorted = [...data.users].sort((a,b)=> (b.pendingRequest?1:0) - (a.pendingRequest?1:0));
+    tbody.innerHTML = sorted.map(u => `
+      <tr style="${u.pendingRequest ? 'background:#1c1608;' : ''}">
+        <td>${u.phone}</td>
+        <td>${u.name||''}</td>
+        <td>${formulaLabel(u)}</td>
+        <td>${statusLabel(u)}</td>
+        <td>${fmtDate(u.expiresAt)}</td>
+        <td>${fmtDate(u.createdAt)}</td>
+        <td>${pendingLabel(u)}</td>
+      </tr>
+    `).join('');
+    document.getElementById('userTable').style.display = 'table';
+    localStorage.setItem('ea_admin_pw', pw);
+    tbody.querySelectorAll('.fillActivateBtn').forEach(btn=>{
+      btn.addEventListener('click', ()=>{
+        document.getElementById('actPhone').value = btn.dataset.phone;
+        document.getElementById('actFormula').value = btn.dataset.formula;
+        document.getElementById('actFormula').dispatchEvent(new Event('change'));
+        if(btn.dataset.sport) document.getElementById('actSport').value = btn.dataset.sport;
+        document.getElementById('actPlan').value = btn.dataset.plan;
+        activate();
+      });
+    });
+  }catch(e){ msgEl.textContent = '✗ Erreur réseau : ' + e.message; }
+}
+async function activate(){
+  const pw = document.getElementById('adminPw').value;
+  const phone = document.getElementById('actPhone').value;
+  const plan = document.getElementById('actPlan').value;
+  const formula = document.getElementById('actFormula').value;
+  const sport = document.getElementById('actSport').value;
+  const msgEl = document.getElementById('actMsg');
+  msgEl.textContent = 'Activation...';
+  try{
+    const r = await fetch('/api/admin/activate', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({adminPassword:pw, phone, plan, formula, sport})
+    });
+    const data = await r.json();
+    if(!r.ok){ msgEl.textContent = '✗ ' + (data.error||'Erreur'); return; }
+    msgEl.textContent = `✓ Activé (${formulaLabel(data)}) jusqu'au ${fmtDate(data.expiresAt)}.`;
+    loadUsers();
+  }catch(e){ msgEl.textContent = '✗ Erreur réseau : ' + e.message; }
+}
+document.getElementById('loadBtn').addEventListener('click', loadUsers);
+document.getElementById('activateBtn').addEventListener('click', activate);
+const saved = localStorage.getItem('ea_admin_pw');
+if(saved){ document.getElementById('adminPw').value = saved; }
+</script>
+</body>
+</html>

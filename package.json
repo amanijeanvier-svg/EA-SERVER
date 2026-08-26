@@ -1,0 +1,12 @@
+{
+  "name": "ea-server",
+  "version": "1.0.0",
+  "description": "Serveur d'abonnement pour EA — Cabinet d'Analyse Privée",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
