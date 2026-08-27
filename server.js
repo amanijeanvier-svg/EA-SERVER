@@ -477,6 +477,134 @@ if (USE_SUPABASE) {
   };
 }
 
+/* ================================================================
+   AUTO-REMPLISSAGE PAR API SPORTIVE (API-Sports / API-Football)
+   — clé UNIQUEMENT côté serveur (API_SPORTS_KEY en variable
+   d'environnement), jamais exposée au client. Résultats mis en cache
+   plusieurs heures par nom d'équipe pour économiser le quota quand
+   plusieurs utilisateurs cherchent la même équipe le même jour.
+   Repli propre : en cas d'échec (équipe introuvable, quota épuisé,
+   service indisponible), on renvoie simplement found:false — le
+   client retombe alors sur la saisie manuelle, jamais de blocage.
+================================================================= */
+const API_SPORTS_KEY = process.env.API_SPORTS_KEY || '';
+const API_SPORTS_BASE = { football: 'https://v3.football.api-sports.io', basketball: 'https://v1.basketball.api-sports.io' };
+const TEAM_LOOKUP_CACHE_TTL = 6 * 60 * 60 * 1000; // 6h — largement assez frais pour un classement/forme d'équipe
+const teamLookupCache = new Map(); // `${sport}:${nom normalisé}` -> {at, data}
+
+async function apiSportsGet(sport, endpoint, params) {
+  const base = API_SPORTS_BASE[sport];
+  const qs = new URLSearchParams(params).toString();
+  const r = await fetch(`${base}${endpoint}?${qs}`, { headers: { 'x-apisports-key': API_SPORTS_KEY } });
+  if (!r.ok) throw new Error(`API-Sports ${endpoint} : ${r.status}`);
+  const data = await r.json();
+  if (data.errors && (Array.isArray(data.errors) ? data.errors.length : Object.keys(data.errors).length)) {
+    throw new Error(`API-Sports ${endpoint} : ${JSON.stringify(data.errors)}`);
+  }
+  return data.response;
+}
+
+async function lookupTeamFootball(teamName) {
+  const teams = await apiSportsGet('football', '/teams', { search: teamName });
+  if (!teams || !teams.length) return { found: false };
+  const team = teams[0].team;
+
+  const leagues = await apiSportsGet('football', '/leagues', { team: team.id, current: 'true' });
+  const domestic = (leagues || []).find(l => l.league && l.league.type === 'League') || (leagues || [])[0];
+  if (!domestic) return { found: true, team: { id: team.id, name: team.name }, standings: null, form: null };
+  const season = (domestic.seasons || []).find(s => s.current) || (domestic.seasons || [])[domestic.seasons.length - 1];
+  if (!season) return { found: true, team: { id: team.id, name: team.name }, standings: null, form: null };
+  const leagueId = domestic.league.id, year = season.year;
+
+  const [standingsResp, fixtures] = await Promise.all([
+    apiSportsGet('football', '/standings', { league: leagueId, season: year }).catch(() => null),
+    apiSportsGet('football', '/fixtures', { team: team.id, last: 15 }).catch(() => []),
+  ]);
+
+  let standings = null;
+  if (standingsResp && standingsResp[0] && standingsResp[0].league && standingsResp[0].league.standings) {
+    const table = standingsResp[0].league.standings.flat();
+    const row = table.find(t => t.team && t.team.id === team.id);
+    if (row) standings = { rank: row.rank, points: row.points, totalTeams: table.length };
+  }
+
+  const played = (fixtures || [])
+    .filter(f => f.fixture && f.fixture.status && f.fixture.status.short === 'FT' && f.goals && f.goals.home != null && f.goals.away != null)
+    .sort((a, b) => new Date(b.fixture.date) - new Date(a.fixture.date));
+  const toPair = (f, isHome) => isHome ? [f.goals.home, f.goals.away] : [f.goals.away, f.goals.home]; // toujours [pour, contre] du point de vue de cette équipe
+  const recent = played.slice(0, 5).map(f => toPair(f, f.teams.home.id === team.id));
+  const home = played.filter(f => f.teams.home.id === team.id).slice(0, 5).map(f => toPair(f, true));
+  const away = played.filter(f => f.teams.away.id === team.id).slice(0, 5).map(f => toPair(f, false));
+
+  return {
+    found: true, team: { id: team.id, name: team.name },
+    league: { id: leagueId, name: domestic.league.name, season: year },
+    standings, form: { recent, home, away },
+  };
+}
+
+async function lookupTeamBasketball(teamName) {
+  const teams = await apiSportsGet('basketball', '/teams', { search: teamName });
+  if (!teams || !teams.length) return { found: false };
+  const team = teams[0];
+
+  const leagues = await apiSportsGet('basketball', '/leagues', {}).catch(() => []);
+  // L'API Basketball n'a pas toujours de /leagues?team=, donc on passe directement par les games
+  // récents de l'équipe pour déduire ligue + saison en cours plutôt que de multiplier les appels.
+  const games = await apiSportsGet('basketball', '/games', { team: team.id, last: 15 }).catch(() => []);
+  if (!games || !games.length) return { found: true, team: { id: team.id, name: team.name }, standings: null, form: null };
+
+  const leagueId = games[0].league && games[0].league.id;
+  const year = games[0].league && (games[0].league.season || games[0].season);
+
+  let standings = null;
+  if (leagueId && year) {
+    try {
+      const standingsResp = await apiSportsGet('basketball', '/standings', { league: leagueId, season: year });
+      const table = (standingsResp || []).flat();
+      const row = table.find(t => t.team && t.team.id === team.id);
+      if (row) standings = { rank: row.position || row.rank, points: row.points ? row.points.for : null, totalTeams: table.length };
+    } catch (e) { /* pas grave : le reste des données reste utilisable sans classement */ }
+  }
+
+  const played = games
+    .filter(g => g.status && (g.status.short === 'FT' || g.status.long === 'Finished') && g.scores && g.scores.home && g.scores.away)
+    .sort((a, b) => new Date(b.date) - new Date(a.date));
+  const scoreOf = (g, side) => (g.scores[side] && (g.scores[side].total != null ? g.scores[side].total : g.scores[side]));
+  const toPair = (g, isHome) => isHome ? [scoreOf(g, 'home'), scoreOf(g, 'away')] : [scoreOf(g, 'away'), scoreOf(g, 'home')];
+  const recent = played.slice(0, 5).map(g => toPair(g, g.teams.home.id === team.id));
+  const home = played.filter(g => g.teams.home.id === team.id).slice(0, 5).map(g => toPair(g, true));
+  const away = played.filter(g => g.teams.away.id === team.id).slice(0, 5).map(g => toPair(g, false));
+
+  return {
+    found: true, team: { id: team.id, name: team.name },
+    league: leagueId ? { id: leagueId, season: year } : null,
+    standings, form: { recent, home, away },
+  };
+}
+
+async function handleTeamLookup(req, res, query) {
+  const user = await verifyAuth(query.phone, query.token);
+  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
+  if (!API_SPORTS_KEY) return sendJSON(res, 200, { found: false, reason: 'unconfigured' });
+  const sport = query.sport === 'basketball' ? 'basketball' : 'football';
+  const teamName = (query.team || '').toString().trim();
+  if (teamName.length < 2) return sendJSON(res, 400, { error: "Nom d'équipe trop court." });
+
+  const cacheKey = `${sport}:${teamName.toLowerCase()}`;
+  const cached = teamLookupCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < TEAM_LOOKUP_CACHE_TTL) return sendJSON(res, 200, cached.data);
+
+  try {
+    const data = sport === 'football' ? await lookupTeamFootball(teamName) : await lookupTeamBasketball(teamName);
+    teamLookupCache.set(cacheKey, { at: Date.now(), data });
+    sendJSON(res, 200, data);
+  } catch (e) {
+    console.error('[team-lookup]', e.message);
+    sendJSON(res, 200, { found: false, reason: 'error' }); // jamais d'erreur dure : le client repasse en saisie manuelle
+  }
+}
+
 /* ---------- Utilitaires ---------- */
 function normalizePhone(p) { return (p || '').toString().replace(/[^0-9+]/g, '').trim(); }
 function slugifyTeam(name) {
@@ -901,7 +1029,11 @@ async function handleCommunitySearch(req, res, query) {
    dépasser un pari à pourcentage plus haut mais sans conviction contextuelle. Un plancher de
    probabilité évite malgré tout de faire remonter un pari trop incertain (un coup de pile ou
    face bien commenté reste un coup de pile ou face). */
-const COMM_BEST_MIN_P = 0.55; // plancher : "modéré et plus", jamais un quasi coin-flip
+const COMM_BEST_MIN_P = 0.50; // plancher : zone "modérée à élevée", jamais un quasi coin-flip
+const COMM_BEST_MAX_P = 0.80; // plafond (hors paris rentables) : au-delà, la cote bookmaker n'a plus grand intérêt réel
+const COMM_OVERUNDER_MAX_P = 0.85; // un over/under au-delà reste à sa place dans Safe Bets, jamais dans Meilleurs Paris
+const COMM_FAVORED_MARKETS = new Set(['score_exact', 'btts', 'double_chance', '1x2']); // cotes structurellement plus intéressantes qu'un over/under
+const COMM_FAVORED_MARKET_BONUS = 1.15;
 const COMM_CONVICTION_WEIGHT = 0.4; // poids max de la conviction contextuelle dans le score
 const COMM_RELIABILITY_MIN_N = 15;
 const communityReliabilityCache = new Map(); // sport -> {at, data}
@@ -921,9 +1053,21 @@ function pickBestBet(analysis) {
   // Un pari RENTABLE (cote connue + edge positif) passe toujours devant un pari juste
   // PROBABLE : une probabilité élevée ne veut rien dire côté argent si la cote du
   // bookmaker ne compense pas le risque (cote trop faible = mise immobilisée pour peu).
-  const profitable = bets.filter(b => b.edge != null && b.edge > 0).sort((a, b) => b.edge - a.edge);
+  // Un over/under déjà quasi automatique (>85%) reste hors-jeu même s'il affiche un edge :
+  // ce n'est jamais lui, l'angle intéressant d'un match.
+  const profitable = bets
+    .filter(b => b.edge != null && b.edge > 0 && !(marketTypeFromEval(b.eval) === 'over_under' && b.p > COMM_OVERUNDER_MAX_P))
+    .sort((a, b) => b.edge - a.edge);
   if (profitable.length) return profitable[0];
-  return bets.slice().sort((a, b) => b.p - a.p)[0] || null;
+  // Sans edge chiffré : on cible la zone "modérée à élevée" (50-80%) où la cote reste
+  // réellement intéressante — pas la sécurité quasi-certaine d'un over/under à 90%+.
+  const inBand = bets.filter(b => {
+    const mt = marketTypeFromEval(b.eval);
+    if (mt === 'over_under' && b.p > COMM_OVERUNDER_MAX_P) return false;
+    return b.p >= COMM_BEST_MIN_P && b.p <= COMM_BEST_MAX_P;
+  });
+  if (!inBand.length) return null; // rien dans la bonne zone pour ce match : il n'apparaît simplement pas ici
+  return inBand.slice().sort((a, b) => b.p - a.p)[0];
 }
 
 async function selectTopCommunityBets(sport, candidates, limit) {
@@ -932,17 +1076,17 @@ async function selectTopCommunityBets(sport, candidates, limit) {
     const bet = pickBestBet(r);
     if (!bet) return null;
     const rentable = bet.edge != null && bet.edge > 0;
-    if (!rentable && bet.p < COMM_BEST_MIN_P) return null; // pas assez solide en soi, quel que soit le contexte
-    const mt = bet.marketType || 'non_classe';
+    const mt = marketTypeFromEval(bet.eval);
     const c = reliability[mt];
     const trustworthy = !(c && c.n >= COMM_RELIABILITY_MIN_N && c.gap > 10); // marché encore "à corriger" : on l'écarte du haut du panier
     if (!trustworthy) return null;
     const reliabilityFactor = (c && c.n >= COMM_RELIABILITY_MIN_N) ? c.hitRate : 1; // pas assez de recul = neutre, pas pénalisé
     const convictionIdx = Math.max(0, Math.min(1, r.convictionIdx || 0));
     const convictionBonus = 1 + COMM_CONVICTION_WEIGHT * convictionIdx; // jusqu'à +40% si enjeu/dynamique/pression au maximum
+    const marketBonus = COMM_FAVORED_MARKETS.has(mt) ? COMM_FAVORED_MARKET_BONUS : 1; // score exact / BTTS / DC-1X2 outsider / handicap : cotes plus intéressantes qu'un over/under
     // +10 garantit qu'un pari rentable sort toujours devant un pari juste probable,
     // quelle que soit sa probabilité brute — la valeur passe avant l'apparence de sûreté.
-    const score = rentable ? (10 + bet.edge) * convictionBonus : bet.p * reliabilityFactor * convictionBonus;
+    const score = rentable ? (10 + bet.edge) * convictionBonus * marketBonus : bet.p * reliabilityFactor * convictionBonus * marketBonus;
     return { analysis: r, bet, marketType: mt, score, reliabilityFactor, reliabilityN: c ? c.n : 0, convictionIdx, rentable };
   }).filter(Boolean).sort((a, b) => b.score - a.score);
 
@@ -990,11 +1134,23 @@ async function handleCommunityFeed(req, res, query) {
       .filter(Boolean);
   } else if (sub === 'score') {
     // Idem : on met en avant le meilleur score exact (topScores), pas un pari classique.
+    // Le seuil de 15% ne s'applique pas à la probabilité brute mais à une probabilité
+    // corrigée par la fiabilité réelle mesurée sur l'historique communautaire vérifié pour
+    // ce marché : si les scores exacts de la communauté sortent historiquement plus souvent
+    // que le modèle ne l'annonce, un score estimé un peu en dessous de 15% peut légitimement
+    // passer. La correction reste prudente (plafonnée à ±10-35%, comme le reste du système
+    // de recalibration de l'appli) pour ne jamais extrapoler au-delà de ce que l'historique
+    // permet réellement d'affirmer.
+    const reliability = await getCommunityReliability(sport);
+    const scoreCal = reliability['score_exact'];
+    const calFactor = (scoreCal && scoreCal.n >= COMM_RELIABILITY_MIN_N && scoreCal.avgP > 0)
+      ? Math.max(0.65, Math.min(1.10, scoreCal.hitRate / scoreCal.avgP)) : 1;
     results = results
       .map(r => {
-        const goodScores = (r.topScores || []).filter(s => s.p >= 0.15);
-        if (!goodScores.length) return null;
-        const bestScore = goodScores.slice().sort((a, b) => b.p - a.p)[0];
+        const scored = (r.topScores || []).map(s => ({ ...s, correctedP: s.p * calFactor }));
+        const eligible = scored.filter(s => s.correctedP >= 0.15);
+        if (!eligible.length) return null;
+        const bestScore = eligible.slice().sort((a, b) => b.correctedP - a.correctedP)[0];
         return { ...r, headlineBet: { label: bestScore.label, p: bestScore.p, marketType: 'score_exact' } };
       })
       .filter(Boolean);
@@ -1078,6 +1234,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/push/subscribe' && req.method === 'POST') return await handlePushSubscribe(req, res);
     if (p === '/api/push/unsubscribe' && req.method === 'POST') return await handlePushUnsubscribe(req, res);
     if (p === '/api/community/search' && req.method === 'GET') return await handleCommunitySearch(req, res, parsed.query);
+    if (p === '/api/team-lookup' && req.method === 'GET') return await handleTeamLookup(req, res, parsed.query);
     if (p === '/api/community/feed' && req.method === 'GET') return await handleCommunityFeed(req, res, parsed.query);
     if (p === '/api/community/verify' && req.method === 'POST') return await handleCommunityVerify(req, res);
     if (p === '/api/leaderboard' && req.method === 'GET') return await handleLeaderboard(req, res, parsed.query);

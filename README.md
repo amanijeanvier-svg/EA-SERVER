@@ -147,6 +147,25 @@ aucune dépendance npm** — comme le reste du serveur.
 Colle aussi le SQL mis à jour de `supabase-setup.sql` (table
 `push_subscriptions`) si tu es en mode Supabase.
 
+## 5ter. Auto-remplissage par API sportive (nouveau)
+
+Un bouton 🔎 à côté du nom de chaque équipe (Genèse et Basket Analyse)
+interroge automatiquement API-Sports (api-sports.io) pour préremplir la
+série récente, la forme domicile/extérieur et le classement — sans jamais
+exposer la clé au client.
+
+**Configuration — une seule variable :**
+- `API_SPORTS_KEY` — ta clé api-sports.io. Sans elle, le bouton répond
+  simplement "indisponible" et l'utilisateur repasse en saisie manuelle
+  (aucun blocage, aucune erreur visible).
+
+**Quota :** chaque recherche d'équipe est mise en cache 6h côté serveur —
+si plusieurs utilisateurs cherchent la même équipe le même jour, un seul
+appel réel part vers API-Sports. Une recherche "à froid" (hors cache)
+coûte environ 3 à 4 appels API-Sports (recherche équipe, ligue en cours,
+classement, derniers matchs) : à surveiller si tu es sur le palier
+gratuit selon ton volume d'utilisateurs.
+
 ## 6. Étape suivante (plus tard)
 
 Quand tu auras un accès à l'API Wave Business (webhooks), on pourra remplacer
