@@ -154,6 +154,29 @@ async function notifyCommunityPublish(nameA, nameB, excludePhone) {
   } catch (e) { console.error('[push] notifyCommunityPublish a échoué :', e.message); }
 }
 
+// Prévient l'AUTEUR (uniquement lui, sur tous ses appareils) que le résultat réel de son
+// analyse vient d'être enregistré — comme SofaScore notifie un score final. On donne le
+// score et le nombre de paris gagnés tout de suite, pas besoin d'ouvrir l'appli pour savoir.
+async function notifyAnalysisVerified(authorPhone, nameA, nameB, finalScore, correctBets, totalBets, exactScoreHit) {
+  try {
+    const subs = await pushStore.listSubscriptions();
+    const mine = subs.filter(s => s.phone === authorPhone);
+    if (!mine.length) return;
+    const scoreLabel = (finalScore && finalScore.a != null && finalScore.b != null) ? `${finalScore.a}-${finalScore.b}` : '';
+    const bits = [`Score final ${scoreLabel}`, `${correctBets}/${totalBets} pari(s) gagné(s)`];
+    if (exactScoreHit) bits.push('score exact trouvé 🎯');
+    const payload = {
+      title: '✅ Résultat confirmé', body: `${nameA} vs ${nameB} — ${bits.join(' · ')}`,
+      tag: 'ea-analysis-verified', url: './',
+    };
+    await Promise.allSettled(mine.map(s =>
+      sendWebPush(s, payload).then(async (r) => {
+        if (r.status === 404 || r.status === 410) await pushStore.deleteSubscription(s.endpoint);
+      }).catch(() => {})
+    ));
+  } catch (e) { console.error('[push] notifyAnalysisVerified a échoué :', e.message); }
+}
+
 /* ================================================================
    COUCHE DE STOCKAGE — même interface (getUser/insertUser/updateUser/
    listUsers) quel que soit le backend, pour que le reste du code
@@ -894,7 +917,13 @@ async function getCommunityReliability(sport) {
 }
 
 function pickBestBet(analysis) {
-  return (analysis.bets || []).slice().sort((a, b) => b.p - a.p)[0] || null;
+  const bets = analysis.bets || [];
+  // Un pari RENTABLE (cote connue + edge positif) passe toujours devant un pari juste
+  // PROBABLE : une probabilité élevée ne veut rien dire côté argent si la cote du
+  // bookmaker ne compense pas le risque (cote trop faible = mise immobilisée pour peu).
+  const profitable = bets.filter(b => b.edge != null && b.edge > 0).sort((a, b) => b.edge - a.edge);
+  if (profitable.length) return profitable[0];
+  return bets.slice().sort((a, b) => b.p - a.p)[0] || null;
 }
 
 async function selectTopCommunityBets(sport, candidates, limit) {
@@ -902,7 +931,8 @@ async function selectTopCommunityBets(sport, candidates, limit) {
   const scored = candidates.map(r => {
     const bet = pickBestBet(r);
     if (!bet) return null;
-    if (bet.p < COMM_BEST_MIN_P) return null; // pas assez solide en soi, quel que soit le contexte
+    const rentable = bet.edge != null && bet.edge > 0;
+    if (!rentable && bet.p < COMM_BEST_MIN_P) return null; // pas assez solide en soi, quel que soit le contexte
     const mt = bet.marketType || 'non_classe';
     const c = reliability[mt];
     const trustworthy = !(c && c.n >= COMM_RELIABILITY_MIN_N && c.gap > 10); // marché encore "à corriger" : on l'écarte du haut du panier
@@ -910,8 +940,10 @@ async function selectTopCommunityBets(sport, candidates, limit) {
     const reliabilityFactor = (c && c.n >= COMM_RELIABILITY_MIN_N) ? c.hitRate : 1; // pas assez de recul = neutre, pas pénalisé
     const convictionIdx = Math.max(0, Math.min(1, r.convictionIdx || 0));
     const convictionBonus = 1 + COMM_CONVICTION_WEIGHT * convictionIdx; // jusqu'à +40% si enjeu/dynamique/pression au maximum
-    const score = bet.p * reliabilityFactor * convictionBonus;
-    return { analysis: r, bet, marketType: mt, score, reliabilityFactor, reliabilityN: c ? c.n : 0, convictionIdx };
+    // +10 garantit qu'un pari rentable sort toujours devant un pari juste probable,
+    // quelle que soit sa probabilité brute — la valeur passe avant l'apparence de sûreté.
+    const score = rentable ? (10 + bet.edge) * convictionBonus : bet.p * reliabilityFactor * convictionBonus;
+    return { analysis: r, bet, marketType: mt, score, reliabilityFactor, reliabilityN: c ? c.n : 0, convictionIdx, rentable };
   }).filter(Boolean).sort((a, b) => b.score - a.score);
 
   // Diversité : jamais plus de 2 paris consécutifs du même type de marché dans le résultat final.
@@ -928,7 +960,7 @@ async function selectTopCommunityBets(sport, candidates, limit) {
   }
   for (const item of leftovers) { if (result.length >= limit) break; result.push(item); }
 
-  return result.map(item => ({ ...item.analysis, headlineBet: item.bet, reliabilityFactor: item.reliabilityFactor, reliabilityN: item.reliabilityN }));
+  return result.map(item => ({ ...item.analysis, headlineBet: item.bet, reliabilityFactor: item.reliabilityFactor, reliabilityN: item.reliabilityN, convictionIdx: item.convictionIdx, rentable: item.rentable }));
 }
 
 async function handleCommunityFeed(req, res, query) {
@@ -943,9 +975,30 @@ async function handleCommunityFeed(req, res, query) {
     results = await selectTopCommunityBets(sport, results, PAGE_SIZE);
     return sendJSON(res, 200, { results, page, perPage: PAGE_SIZE });
   }
-  if (sub === 'safe') results = results.filter(r => (r.bets || []).some(b => b.p >= 0.82));
-  else if (sub === 'value') results = results.filter(r => (r.bets || []).some(b => b.edge != null && b.edge > 0));
-  else if (sub === 'score') results = results.filter(r => (r.topScores || []).some(s => s.p >= 0.15));
+  if (sub === 'safe') {
+    results = results.filter(r => (r.bets || []).some(b => b.p >= 0.82));
+  } else if (sub === 'value') {
+    // La carte doit montrer LE pari qui a la meilleure valeur réelle (edge), pas le plus probable :
+    // un pari à 56% avec un edge de +76% est plus intéressant qu'un pari à 90% sans edge positif.
+    results = results
+      .map(r => {
+        const valueBets = (r.bets || []).filter(b => b.edge != null && b.edge > 0);
+        if (!valueBets.length) return null;
+        const bestValueBet = valueBets.slice().sort((a, b) => b.edge - a.edge)[0];
+        return { ...r, headlineBet: bestValueBet };
+      })
+      .filter(Boolean);
+  } else if (sub === 'score') {
+    // Idem : on met en avant le meilleur score exact (topScores), pas un pari classique.
+    results = results
+      .map(r => {
+        const goodScores = (r.topScores || []).filter(s => s.p >= 0.15);
+        if (!goodScores.length) return null;
+        const bestScore = goodScores.slice().sort((a, b) => b.p - a.p)[0];
+        return { ...r, headlineBet: { label: bestScore.label, p: bestScore.p, marketType: 'score_exact' } };
+      })
+      .filter(Boolean);
+  }
   sendJSON(res, 200, { results: results.slice(0, PAGE_SIZE), page, perPage: PAGE_SIZE });
 }
 
@@ -968,6 +1021,8 @@ async function handleCommunityVerify(req, res) {
   const exactScoreHit = evaluations.some(e => e.marketType === 'score_exact' && e.hit === true);
   const bonusXP = correctBets * XP_PER_CORRECT_BET + (exactScoreHit ? XP_EXACT_SCORE : 0);
   if (bonusXP > 0) await store.incrementUserStats(existing.authorPhone, { xpDelta: bonusXP });
+
+  notifyAnalysisVerified(existing.authorPhone, existing.nameA, existing.nameB, finalScore, correctBets, evaluations.length, exactScoreHit); // best-effort
 
   sendJSON(res, 200, { ok: true, analysis: row, bonusXpAwarded: bonusXP });
 }
