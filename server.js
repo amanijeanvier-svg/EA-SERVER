@@ -492,7 +492,19 @@ const API_SPORTS_BASE = { football: 'https://v3.football.api-sports.io', basketb
 const TEAM_LOOKUP_CACHE_TTL = 6 * 60 * 60 * 1000; // 6h — largement assez frais pour un classement/forme d'équipe
 const teamLookupCache = new Map(); // `${sport}:${nom normalisé}` -> {at, data}
 
+// Espacement global entre deux appels à API-Sports, quelle que soit la recherche ou
+// l'utilisateur qui les déclenche. Une seule recherche d'équipe enchaîne déjà plusieurs
+// appels (équipe, ligues, matchs récents, classement) ; si deux utilisateurs cherchent en
+// même temps, ces séquences peuvent se chevaucher et ressembler à une rafale de requêtes
+// aux yeux d'API-Sports. Cette file d'attente garantit un minimum de temps entre CHAQUE
+// appel, peu importe d'où il vient, sans que le code appelant ait à s'en soucier.
+const API_SPORTS_MIN_GAP_MS = 350;
+let apiSportsQueue = Promise.resolve();
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
 async function apiSportsGet(sport, endpoint, params) {
+  const myTurn = apiSportsQueue = apiSportsQueue.then(() => sleep(API_SPORTS_MIN_GAP_MS));
+  await myTurn;
   const base = API_SPORTS_BASE[sport];
   const qs = new URLSearchParams(params).toString();
   const r = await fetch(`${base}${endpoint}?${qs}`, { headers: { 'x-apisports-key': API_SPORTS_KEY } });
