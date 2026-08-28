@@ -496,10 +496,12 @@ async function apiSportsGet(sport, endpoint, params) {
   const base = API_SPORTS_BASE[sport];
   const qs = new URLSearchParams(params).toString();
   const r = await fetch(`${base}${endpoint}?${qs}`, { headers: { 'x-apisports-key': API_SPORTS_KEY } });
-  if (!r.ok) throw new Error(`API-Sports ${endpoint} : ${r.status}`);
+  if (!r.ok) { const err = new Error(`API-Sports ${endpoint} : ${r.status}`); err.status = r.status; throw err; }
   const data = await r.json();
   if (data.errors && (Array.isArray(data.errors) ? data.errors.length : Object.keys(data.errors).length)) {
-    throw new Error(`API-Sports ${endpoint} : ${JSON.stringify(data.errors)}`);
+    const err = new Error(`API-Sports ${endpoint} : ${JSON.stringify(data.errors)}`);
+    err.apiErrors = data.errors;
+    throw err;
   }
   return data.response;
 }
@@ -564,12 +566,15 @@ async function lookupTeamFootball(teamName) {
     away: played.filter(f => f.teams.away.id === team.id).slice(0, 5).map(f => toPair(f, false)),
   } : null;
 
-  // Classement : le plan gratuit ne couvre pas toujours la saison en cours pour
-  // chaque compétition. On essaie la saison en cours puis, si vide, jusqu'à
-  // deux saisons précédentes disponibles avant d'abandonner.
+  // Classement : uniquement la saison en cours. On limitait avant à 3 tentatives
+  // (jusqu'à 2 saisons précédentes) mais chaque tentative coûte un appel API —
+  // sur le plan gratuit (100/jour, partagé par tous les utilisateurs), ça épuise
+  // le quota en quelques recherches seulement. Une seule tentative suffit dans
+  // l'immense majorité des cas ; le classement reste simplement vide sinon,
+  // sans bloquer le reste (forme, équipe trouvée).
   const seasonsToTry = [...domestic.seasons]
     .sort((a, b) => (b.current === true) - (a.current === true) || b.year - a.year)
-    .map(s => s.year).slice(0, 3);
+    .map(s => s.year).slice(0, 1);
   let standings = null, usedSeason = null;
   for (const year of seasonsToTry) {
     const standingsResp = await apiSportsGet('football', '/standings', { league: leagueId, season: year }).catch(() => null);
@@ -645,7 +650,18 @@ async function handleTeamLookup(req, res, query) {
     sendJSON(res, 200, data);
   } catch (e) {
     console.error('[team-lookup]', e.message);
-    sendJSON(res, 200, { found: false, reason: 'error' }); // jamais d'erreur dure : le client repasse en saisie manuelle
+    // On distingue la cause pour que l'utilisateur (et nous, en support) sache si
+    // c'est vraiment "équipe absente de la base" ou un problème de service —
+    // avant, tout tombait dans le même message trompeur "équipe introuvable".
+    let reason = 'error';
+    if (e.status === 429) reason = 'quota';
+    else if (e.status === 401 || e.status === 403) reason = 'auth';
+    else if (e.apiErrors) {
+      const msg = JSON.stringify(e.apiErrors).toLowerCase();
+      if (msg.includes('rate limit') || msg.includes('quota') || msg.includes('requests')) reason = 'quota';
+      else if (msg.includes('token') || msg.includes('key')) reason = 'auth';
+    }
+    sendJSON(res, 200, { found: false, reason }); // jamais d'erreur dure : le client repasse en saisie manuelle
   }
 }
 
