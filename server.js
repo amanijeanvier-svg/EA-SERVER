@@ -504,47 +504,91 @@ async function apiSportsGet(sport, endpoint, params) {
   return data.response;
 }
 
+// L'API recherche par correspondance sur le nom OFFICIEL (souvent anglais/local) —
+// une graphie française ("Barcelone", "Séville"...) ou un préfixe générique
+// ("FC ", "AS "...) suffit à ne rien trouver, même pour un club mondialement connu.
+// On tente donc plusieurs variantes dans l'ordre jusqu'à ce qu'une matche.
+const FR_TEAM_NAME_ALIASES = {
+  'barcelone': 'barcelona', 'seville': 'sevilla', 'séville': 'sevilla',
+  'naples': 'napoli', 'turin': 'torino', 'moscou': 'moscow',
+  'cologne': 'koln', 'athenes': 'athens', 'athènes': 'athens',
+  'lisbonne': 'lisbon', 'varsovie': 'warsaw', 'genes': 'genoa', 'gênes': 'genoa',
+  'florence': 'fiorentina', 'venise': 'venezia',
+};
+const GENERIC_TEAM_PREFIX = /^(fc|cf|ac|as|rc|sc|cd|ca|us|ss|sv|vfl|vfb|real|club|racing|sporting|olympique|stade|athletic|atletico|atlético|deportivo)\s+/i;
+
+function buildTeamSearchCandidates(rawName) {
+  const trimmed = (rawName || '').trim();
+  const candidates = [trimmed];
+  const noPrefix = trimmed.replace(GENERIC_TEAM_PREFIX, '').trim();
+  if (noPrefix && noPrefix.length >= 3) candidates.push(noPrefix);
+  for (const base of [trimmed, noPrefix]) {
+    const lower = base.toLowerCase();
+    for (const [fr, en] of Object.entries(FR_TEAM_NAME_ALIASES)) {
+      if (lower.includes(fr)) candidates.push(lower.split(fr).join(en));
+    }
+  }
+  return [...new Set(candidates)].filter(c => c.length >= 3);
+}
+
+async function searchTeamAcrossVariants(sport, teamName) {
+  for (const q of buildTeamSearchCandidates(teamName)) {
+    const teams = await apiSportsGet(sport, '/teams', { search: q });
+    if (teams && teams.length) return teams;
+  }
+  return [];
+}
+
 async function lookupTeamFootball(teamName) {
-  const teams = await apiSportsGet('football', '/teams', { search: teamName });
+  const teams = await searchTeamAcrossVariants('football', teamName);
   if (!teams || !teams.length) return { found: false };
   const team = teams[0].team;
 
   const leagues = await apiSportsGet('football', '/leagues', { team: team.id, current: 'true' });
   const domestic = (leagues || []).find(l => l.league && l.league.type === 'League') || (leagues || [])[0];
-  if (!domestic) return { found: true, team: { id: team.id, name: team.name }, standings: null, form: null };
-  const season = (domestic.seasons || []).find(s => s.current) || (domestic.seasons || [])[domestic.seasons.length - 1];
-  if (!season) return { found: true, team: { id: team.id, name: team.name }, standings: null, form: null };
-  const leagueId = domestic.league.id, year = season.year;
-
-  const [standingsResp, fixtures] = await Promise.all([
-    apiSportsGet('football', '/standings', { league: leagueId, season: year }).catch(() => null),
-    apiSportsGet('football', '/fixtures', { team: team.id, last: 15 }).catch(() => []),
-  ]);
-
-  let standings = null;
-  if (standingsResp && standingsResp[0] && standingsResp[0].league && standingsResp[0].league.standings) {
-    const table = standingsResp[0].league.standings.flat();
-    const row = table.find(t => t.team && t.team.id === team.id);
-    if (row) standings = { rank: row.rank, points: row.points, totalTeams: table.length };
+  if (!domestic || !domestic.seasons || !domestic.seasons.length) {
+    return { found: true, team: { id: team.id, name: team.name }, league: null, standings: null, form: null };
   }
+  const leagueId = domestic.league.id;
 
-  const played = (fixtures || [])
+  // Forme récente : "last=15" capte les matchs les plus récents peu importe la saison —
+  // pas besoin de deviner laquelle, contrairement au classement.
+  const fixturesRaw = await apiSportsGet('football', '/fixtures', { team: team.id, last: 15 }).catch(() => []);
+  const played = (fixturesRaw || [])
     .filter(f => f.fixture && f.fixture.status && f.fixture.status.short === 'FT' && f.goals && f.goals.home != null && f.goals.away != null)
     .sort((a, b) => new Date(b.fixture.date) - new Date(a.fixture.date));
   const toPair = (f, isHome) => isHome ? [f.goals.home, f.goals.away] : [f.goals.away, f.goals.home]; // toujours [pour, contre] du point de vue de cette équipe
-  const recent = played.slice(0, 5).map(f => toPair(f, f.teams.home.id === team.id));
-  const home = played.filter(f => f.teams.home.id === team.id).slice(0, 5).map(f => toPair(f, true));
-  const away = played.filter(f => f.teams.away.id === team.id).slice(0, 5).map(f => toPair(f, false));
+  const form = played.length ? {
+    recent: played.slice(0, 5).map(f => toPair(f, f.teams.home.id === team.id)),
+    home: played.filter(f => f.teams.home.id === team.id).slice(0, 5).map(f => toPair(f, true)),
+    away: played.filter(f => f.teams.away.id === team.id).slice(0, 5).map(f => toPair(f, false)),
+  } : null;
+
+  // Classement : le plan gratuit ne couvre pas toujours la saison en cours pour
+  // chaque compétition. On essaie la saison en cours puis, si vide, jusqu'à
+  // deux saisons précédentes disponibles avant d'abandonner.
+  const seasonsToTry = [...domestic.seasons]
+    .sort((a, b) => (b.current === true) - (a.current === true) || b.year - a.year)
+    .map(s => s.year).slice(0, 3);
+  let standings = null, usedSeason = null;
+  for (const year of seasonsToTry) {
+    const standingsResp = await apiSportsGet('football', '/standings', { league: leagueId, season: year }).catch(() => null);
+    if (standingsResp && standingsResp[0] && standingsResp[0].league && standingsResp[0].league.standings) {
+      const table = standingsResp[0].league.standings.flat();
+      const row = table.find(t => t.team && t.team.id === team.id);
+      if (row) { standings = { rank: row.rank, points: row.points, totalTeams: table.length }; usedSeason = year; break; }
+    }
+  }
 
   return {
     found: true, team: { id: team.id, name: team.name },
-    league: { id: leagueId, name: domestic.league.name, season: year },
-    standings, form: { recent, home, away },
+    league: { id: leagueId, name: domestic.league.name, season: usedSeason || seasonsToTry[0] || null },
+    standings, form,
   };
 }
 
 async function lookupTeamBasketball(teamName) {
-  const teams = await apiSportsGet('basketball', '/teams', { search: teamName });
+  const teams = await searchTeamAcrossVariants('basketball', teamName);
   if (!teams || !teams.length) return { found: false };
   const team = teams[0];
 
