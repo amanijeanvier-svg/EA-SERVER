@@ -177,6 +177,119 @@ async function notifyAnalysisVerified(authorPhone, nameA, nameB, finalScore, cor
   } catch (e) { console.error('[push] notifyAnalysisVerified a échoué :', e.message); }
 }
 
+// Diffuse à TOUTE la communauté (sauf l'auteur) quand un pari vérifié est vraiment notable —
+// score exact trouvé, ou sans-faute sur au moins 2 paris — avec identification claire de
+// l'auteur (3.2). Réservé aux résultats qui donnent vraiment envie d'aller voir l'analyse ;
+// à chaque vérification ce serait un flot continu, ça arrive tout le temps.
+async function notifyCommunityWin(authorPhone, nameA, nameB, correctBets, totalBets, exactScoreHit) {
+  const notable = exactScoreHit || (totalBets >= 2 && correctBets === totalBets);
+  if (!notable) return;
+  try {
+    const author = await store.getUser(authorPhone);
+    const authorLabel = (author && author.pseudo) || 'Un analyste';
+    const subs = await pushStore.listSubscriptions();
+    const others = subs.filter(s => s.phone !== authorPhone);
+    const payload = {
+      title: '🎉 Pari vérifié gagnant',
+      body: `${authorLabel} avait vu juste sur ${nameA} vs ${nameB}${exactScoreHit ? ' (score exact 🎯)' : ''} — à découvrir dans Communauté`,
+      tag: 'ea-community-win', url: './',
+    };
+    await Promise.allSettled(others.map(s =>
+      sendWebPush(s, payload).then(async (r) => {
+        if (r.status === 404 || r.status === 410) await pushStore.deleteSubscription(s.endpoint);
+      }).catch(() => {})
+    ));
+  } catch (e) { console.error('[push] notifyCommunityWin a échoué :', e.message); }
+}
+
+/* ================================================================
+   TÂCHES PÉRIODIQUES (5.8 rappels de renouvellement J-2/J-1, 3.3 récaps
+   classement jour/semaine/mois) — pas de cron externe disponible sur ce
+   type d'hébergement minimal, donc un simple setInterval qui vérifie
+   régulièrement si c'est le moment d'agir. L'état ("déjà envoyé
+   aujourd'hui/cette semaine/ce mois") est gardé EN MÉMOIRE : si le
+   serveur redémarre (ça arrive sur Render), un envoi peut exceptionnellement
+   être sauté ou répété une fois — sans gravité pour ce type de rappel.
+================================================================= */
+const _periodicState = { renewalReminders: new Set(), dailyRecapDate: null, weeklyRecapWeek: null, monthlyRecapMonth: null };
+function isoDate(d) { return d.toISOString().slice(0, 10); }
+function isoWeekKey(d) {
+  const t = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  t.setUTCDate(t.getUTCDate() + 3 - (t.getUTCDay() + 6) % 7);
+  const week1 = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
+  const weekNum = 1 + Math.round(((t - week1) / 86400000 - 3 + (week1.getUTCDay() + 6) % 7) / 7);
+  return `${t.getUTCFullYear()}-W${String(weekNum).padStart(2, '0')}`;
+}
+
+async function checkRenewalReminders() {
+  try {
+    const users = await store.listUsers();
+    const now = Date.now();
+    for (const u of users) {
+      if (!u.subscription || !u.subscription.expiresAt) continue;
+      const daysLeft = Math.ceil((u.subscription.expiresAt - now) / 86400000);
+      if (daysLeft !== 2 && daysLeft !== 1) continue;
+      const key = `${u.phone}:${isoDate(new Date(u.subscription.expiresAt))}:${daysLeft}`;
+      if (_periodicState.renewalReminders.has(key)) continue;
+      _periodicState.renewalReminders.add(key);
+      const subs = (await pushStore.listSubscriptions()).filter(s => s.phone === u.phone);
+      if (!subs.length) continue;
+      const payload = {
+        title: daysLeft === 1 ? '⏰ Abonnement expire demain' : '⏰ Abonnement expire dans 2 jours',
+        body: "Renouvelez dès maintenant pour ne pas perdre l'accès à vos analyses et à la Communauté.",
+        tag: 'ea-renewal-reminder', url: './',
+      };
+      await Promise.allSettled(subs.map(s => sendWebPush(s, payload).catch(() => {})));
+    }
+  } catch (e) { console.error('[cron] checkRenewalReminders a échoué :', e.message); }
+}
+
+async function broadcastLeaderboardRecap(title, bodyIntro) {
+  const top = await store.topUsers(3);
+  if (!top.length) return;
+  const names = top.map((u, i) => `${i + 1}. ${u.pseudo || 'Anonyme'}`).join('  ·  ');
+  const subs = await pushStore.listSubscriptions();
+  const payload = { title, body: `${bodyIntro} ${names}`, tag: 'ea-leaderboard-recap', url: './' };
+  await Promise.allSettled(subs.map(s =>
+    sendWebPush(s, payload).then(async (r) => {
+      if (r.status === 404 || r.status === 410) await pushStore.deleteSubscription(s.endpoint);
+    }).catch(() => {})
+  ));
+}
+
+// Fréquence volontairement maîtrisée (3.3) : jamais de classement quotidien répété à
+// toute heure, un seul créneau (22h UTC — ajuste si ton public est ailleurs) et une
+// seule diffusion par jour/semaine/mois grâce aux clés de déduplication ci-dessus.
+async function checkLeaderboardRecaps() {
+  try {
+    const now = new Date();
+    if (now.getUTCHours() !== 22) return;
+    const today = isoDate(now);
+    if (_periodicState.dailyRecapDate !== today) {
+      _periodicState.dailyRecapDate = today;
+      await broadcastLeaderboardRecap('🏆 Top du jour', "Meilleurs analystes aujourd'hui :");
+    }
+    if (now.getUTCDay() === 0) {
+      const week = isoWeekKey(now);
+      if (_periodicState.weeklyRecapWeek !== week) {
+        _periodicState.weeklyRecapWeek = week;
+        await broadcastLeaderboardRecap('📅 Top de la semaine', 'Meilleurs contributeurs cette semaine :');
+      }
+    }
+    const tomorrow = new Date(now.getTime() + 86400000);
+    if (tomorrow.getUTCDate() === 1) {
+      const month = `${now.getUTCFullYear()}-${now.getUTCMonth()}`;
+      if (_periodicState.monthlyRecapMonth !== month) {
+        _periodicState.monthlyRecapMonth = month;
+        await broadcastLeaderboardRecap('🗓️ Top du mois', 'Meilleurs contributeurs ce mois-ci :');
+      }
+    }
+  } catch (e) { console.error('[cron] checkLeaderboardRecaps a échoué :', e.message); }
+}
+
+setInterval(() => { checkRenewalReminders(); checkLeaderboardRecaps(); }, 60 * 60 * 1000);
+setTimeout(() => { checkRenewalReminders(); checkLeaderboardRecaps(); }, 60 * 1000); // premier passage sans attendre une heure pile
+
 /* ================================================================
    COUCHE DE STOCKAGE — même interface (getUser/insertUser/updateUser/
    listUsers) quel que soit le backend, pour que le reste du code
@@ -203,6 +316,7 @@ if (USE_SUPABASE) {
       token: r.token, createdAt: Number(r.created_at), trialEndsAt: Number(r.trial_ends_at),
       subscription: r.subscription || null, pendingRequest: r.pending_request || null,
       pseudo: r.pseudo || null, xp: r.xp || 0, analysesCount: r.analyses_count || 0,
+      streak: r.streak || 0, lastCheckinDate: r.last_checkin_date || null,
     };
   }
   function userToRow(u) {
@@ -211,6 +325,7 @@ if (USE_SUPABASE) {
       token: u.token, created_at: u.createdAt, trial_ends_at: u.trialEndsAt,
       subscription: u.subscription, pending_request: u.pendingRequest || null,
       pseudo: u.pseudo || null, xp: u.xp || 0, analyses_count: u.analysesCount || 0,
+      streak: u.streak || 0, last_checkin_date: u.lastCheckinDate || null,
     };
   }
   store = {
@@ -235,6 +350,8 @@ if (USE_SUPABASE) {
       if ('pendingRequest' in patch) row.pending_request = patch.pendingRequest;
       if ('token' in patch) row.token = patch.token;
       if ('pseudo' in patch) row.pseudo = patch.pseudo;
+      if ('streak' in patch) row.streak = patch.streak;
+      if ('lastCheckinDate' in patch) row.last_checkin_date = patch.lastCheckinDate;
       const r = await fetch(`${REST}/users?phone=eq.${encodeURIComponent(phone)}`, {
         method: 'PATCH', headers: { ...HEADERS, 'Prefer': 'return=representation' },
         body: JSON.stringify(row),
@@ -405,7 +522,7 @@ if (USE_SUPABASE) {
   }
   store = {
     async getUser(phone) { return db.users[phone] || null; },
-    async insertUser(user) { db.users[user.phone] = { xp: 0, analysesCount: 0, pseudo: null, ...user }; await saveDB(); return db.users[user.phone]; },
+    async insertUser(user) { db.users[user.phone] = { xp: 0, analysesCount: 0, pseudo: null, streak: 0, lastCheckinDate: null, ...user }; await saveDB(); return db.users[user.phone]; },
     async updateUser(phone, patch) {
       const u = db.users[phone]; if (!u) return null;
       Object.assign(u, patch); await saveDB(); return u;
@@ -1251,8 +1368,52 @@ async function handleCommunityVerify(req, res) {
   if (bonusXP > 0) await store.incrementUserStats(existing.authorPhone, { xpDelta: bonusXP });
 
   notifyAnalysisVerified(existing.authorPhone, existing.nameA, existing.nameB, finalScore, correctBets, evaluations.length, exactScoreHit); // best-effort
+  notifyCommunityWin(existing.authorPhone, existing.nameA, existing.nameB, correctBets, evaluations.length, exactScoreHit); // best-effort
 
   sendJSON(res, 200, { ok: true, analysis: row, bonusXpAwarded: bonusXP });
+}
+
+// Endpoint PUBLIC (aucune authentification) : c'est justement le but — le taux de
+// réussite doit être visible AVANT l'inscription, sur l'écran de connexion, comme
+// argument de confiance. Agrégé sur tous les paris vérifiés de toute la communauté,
+// toutes disciplines confondues.
+async function handlePublicStats(req, res) {
+  try {
+    const [fb, bk] = await Promise.all([
+      communityStore.listVerified('football', 2000),
+      communityStore.listVerified('basketball', 2000),
+    ]);
+    const allEvals = [...fb, ...bk].flatMap(e => e.evaluations || []);
+    const verifiable = allEvals.filter(e => e.hit === true || e.hit === false);
+    const wins = verifiable.filter(e => e.hit === true).length;
+    const winRate = verifiable.length ? wins / verifiable.length : null;
+    sendJSON(res, 200, { winRate, totalVerifiedBets: verifiable.length, totalVerifiedMatches: fb.length + bk.length });
+  } catch (e) {
+    sendJSON(res, 200, { winRate: null, totalVerifiedBets: 0, totalVerifiedMatches: 0 });
+  }
+}
+
+const XP_DAILY_CHECKIN = 2;
+const XP_STREAK_MILESTONE = { 7: 20, 30: 100 }; // petit bonus aux paliers, pour donner un objectif à viser
+
+// Pointage quotidien pour la série de connexions (5.7). Validé côté serveur (date du
+// jour + dernier pointage stockés sur le compte) plutôt que côté client, pour qu'on ne
+// puisse pas gonfler sa série en trafiquant le localStorage.
+async function handleStreakCheckin(req, res) {
+  const body = await readBody(req);
+  const user = await verifyAuth(body.phone, body.token);
+  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
+  const today = new Date().toISOString().slice(0, 10);
+  if (user.lastCheckinDate === today) {
+    return sendJSON(res, 200, { alreadyCheckedIn: true, streak: user.streak || 0, xpEarned: 0 });
+  }
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const newStreak = (user.lastCheckinDate === yesterday) ? (user.streak || 0) + 1 : 1;
+  let xpEarned = XP_DAILY_CHECKIN;
+  if (XP_STREAK_MILESTONE[newStreak]) xpEarned += XP_STREAK_MILESTONE[newStreak];
+  await store.updateUser(user.phone, { streak: newStreak, lastCheckinDate: today });
+  await store.incrementUserStats(user.phone, { xpDelta: xpEarned });
+  sendJSON(res, 200, { alreadyCheckedIn: false, streak: newStreak, xpEarned, milestone: XP_STREAK_MILESTONE[newStreak] || null });
 }
 
 async function handleLeaderboard(req, res, query) {
@@ -1310,6 +1471,8 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/community/feed' && req.method === 'GET') return await handleCommunityFeed(req, res, parsed.query);
     if (p === '/api/community/verify' && req.method === 'POST') return await handleCommunityVerify(req, res);
     if (p === '/api/leaderboard' && req.method === 'GET') return await handleLeaderboard(req, res, parsed.query);
+    if (p === '/api/public-stats' && req.method === 'GET') return await handlePublicStats(req, res);
+    if (p === '/api/streak-checkin' && req.method === 'POST') return await handleStreakCheckin(req, res);
     if (p === '/api/pseudo' && req.method === 'POST') return await handleSetPseudo(req, res);
     sendJSON(res, 404, { error: 'Route inconnue.' });
   } catch (e) {

@@ -136,3 +136,7 @@ create index if not exists push_subscriptions_phone_idx on public.push_subscript
 
 alter table public.push_subscriptions disable row level security;
 grant all on public.push_subscriptions to service_role;
+
+-- Série de connexions quotidiennes (5.7).
+alter table public.users add column if not exists streak integer not null default 0;
+alter table public.users add column if not exists last_checkin_date text;
