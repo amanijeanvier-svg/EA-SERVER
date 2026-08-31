@@ -140,3 +140,19 @@ grant all on public.push_subscriptions to service_role;
 -- Série de connexions quotidiennes (5.7).
 alter table public.users add column if not exists streak integer not null default 0;
 alter table public.users add column if not exists last_checkin_date text;
+
+-- Combinés générés automatiquement par la Communauté, par jour et par catégorie de risque.
+create table if not exists public.community_combos (
+  id text primary key,
+  day text not null,
+  sport text not null,
+  risk_level text not null,
+  legs jsonb not null,
+  combined_p double precision,
+  combined_odds double precision,
+  created_at bigint not null
+);
+create index if not exists community_combos_day_sport_idx on public.community_combos (day, sport);
+
+alter table public.community_combos disable row level security;
+grant all on public.community_combos to service_role;

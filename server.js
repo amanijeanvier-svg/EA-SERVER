@@ -299,6 +299,7 @@ let store;
 let trackStore;
 let communityStore;
 let pushStore;
+let comboStore;
 
 if (USE_SUPABASE) {
   console.log('[DB] Mode Supabase actif — les données sont persistantes.');
@@ -453,6 +454,15 @@ if (USE_SUPABASE) {
       const rows = await r.json();
       return rows.map(rowToAnalysis);
     },
+    // Analyses PUBLIÉES (peu importe vérifiées ou pas) dans une fenêtre de temps donnée —
+    // sert à construire les combinés du jour (legs choisis parmi ce qui a été publié ce jour-là).
+    async listPublishedInRange(sport, startMs, endMs, limit = 200) {
+      const filter = `and=(sport.eq.${sport},timestamp.gte.${startMs},timestamp.lt.${endMs})`;
+      const r = await fetch(`${REST}/community_analyses?${filter}&order=timestamp.desc&limit=${limit}`, { headers: HEADERS });
+      if (!r.ok) throw new Error(`Supabase listPublishedInRange: ${r.status} ${await r.text()}`);
+      const rows = await r.json();
+      return rows.map(rowToAnalysis);
+    },
     async markVerified(id, finalScore, evaluations) {
       const r = await fetch(`${REST}/community_analyses?id=eq.${id}`, {
         method: 'PATCH', headers: { ...HEADERS, 'Prefer': 'return=representation' },
@@ -473,6 +483,17 @@ if (USE_SUPABASE) {
       if (!r.ok) throw new Error(`Supabase listVerified: ${r.status} ${await r.text()}`);
       const rows = await r.json();
       return rows.map(row => ({ evaluations: row.evaluations || [] }));
+    },
+    // Historique communauté par jour (nouveau) : entrées complètes (pas juste evaluations),
+    // vérifiées depuis sinceMs — sert le fil "Historique" de la Communauté (fenêtre de 20j)
+    // et le "Mur des scores exacts". PostgREST exige and=(...) pour combiner plusieurs
+    // filtres — voir la remarque plus haut sur le même piège pour search().
+    async listVerifiedFull(sport, sinceMs, limit = 500) {
+      const filter = `and=(sport.eq.${sport},verified_at.not.is.null,verified_at.gte.${sinceMs})`;
+      const r = await fetch(`${REST}/community_analyses?${filter}&order=verified_at.desc&limit=${limit}`, { headers: HEADERS });
+      if (!r.ok) throw new Error(`Supabase listVerifiedFull: ${r.status} ${await r.text()}`);
+      const rows = await r.json();
+      return rows.map(rowToAnalysis);
     },
   };
 
@@ -496,6 +517,24 @@ if (USE_SUPABASE) {
       if (!r.ok) throw new Error(`Supabase listSubscriptions: ${r.status} ${await r.text()}`);
       const rows = await r.json();
       return rows.map(row => ({ phone: row.phone, endpoint: row.endpoint, p256dh: row.p256dh, auth: row.auth }));
+    },
+  };
+
+  // Combinés générés automatiquement par la Communauté, par jour et par catégorie de risque
+  // (nouveau) — une fois créés pour un jour donné, les legs ne bougent plus (stabilité
+  // nécessaire pour qu'un combiné puisse être "perdu" au sens propre).
+  comboStore = {
+    async listForDay(day, sport) {
+      const filter = `and=(day.eq.${day},sport.eq.${sport})`;
+      const r = await fetch(`${REST}/community_combos?${filter}&select=*`, { headers: HEADERS });
+      if (!r.ok) throw new Error(`Supabase comboStore.listForDay: ${r.status} ${await r.text()}`);
+      const rows = await r.json();
+      return rows.map(row => ({ id: row.id, day: row.day, sport: row.sport, riskLevel: row.risk_level, legs: row.legs, combinedP: row.combined_p, combinedOdds: row.combined_odds, createdAt: row.created_at }));
+    },
+    async save(combo) {
+      const row = { id: combo.id, day: combo.day, sport: combo.sport, risk_level: combo.riskLevel, legs: combo.legs, combined_p: combo.combinedP, combined_odds: combo.combinedOdds, created_at: combo.createdAt };
+      const r = await fetch(`${REST}/community_combos`, { method: 'POST', headers: { ...HEADERS, 'Prefer': 'resolution=merge-duplicates' }, body: JSON.stringify(row) });
+      if (!r.ok) throw new Error(`Supabase comboStore.save: ${r.status} ${await r.text()}`);
     },
   };
 } else {
@@ -566,6 +605,10 @@ if (USE_SUPABASE) {
       const matches = db.community.filter(r => r.sport === sport).sort((a, b) => b.timestamp - a.timestamp);
       return matches.slice(page * perPage, page * perPage + perPage);
     },
+    async listPublishedInRange(sport, startMs, endMs, limit = 200) {
+      return db.community.filter(r => r.sport === sport && r.timestamp >= startMs && r.timestamp < endMs)
+        .sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
+    },
     async markVerified(id, finalScore, evaluations) {
       const row = db.community.find(r => r.id === id); if (!row) return null;
       row.finalScore = finalScore; row.evaluations = evaluations; row.verifiedAt = Date.now();
@@ -575,6 +618,10 @@ if (USE_SUPABASE) {
     async getById(id) { return db.community.find(r => r.id === id) || null; },
     async listVerified(sport, limit = 500) {
       return db.community.filter(r => r.sport === sport && r.verifiedAt).slice(-limit).map(r => ({ evaluations: r.evaluations || [] }));
+    },
+    async listVerifiedFull(sport, sinceMs, limit = 500) {
+      return db.community.filter(r => r.sport === sport && r.verifiedAt && r.verifiedAt >= sinceMs)
+        .sort((a, b) => b.verifiedAt - a.verifiedAt).slice(0, limit);
     },
   };
 
@@ -591,6 +638,17 @@ if (USE_SUPABASE) {
       await saveDB();
     },
     async listSubscriptions() { return db.pushSubscriptions; },
+  };
+
+  if (!db.combos) db.combos = [];
+  comboStore = {
+    async listForDay(day, sport) {
+      return db.combos.filter(c => c.day === day && c.sport === sport);
+    },
+    async save(combo) {
+      db.combos.push(combo);
+      await saveDB();
+    },
   };
 }
 
@@ -1377,6 +1435,129 @@ async function handleCommunityVerify(req, res) {
 // réussite doit être visible AVANT l'inscription, sur l'écran de connexion, comme
 // argument de confiance. Agrégé sur tous les paris vérifiés de toute la communauté,
 // toutes disciplines confondues.
+const COMMUNITY_HISTORY_WINDOW_DAYS = 20;
+
+// Historique communauté par jour (nouveau) : tous les paris vérifiés des 20 derniers jours,
+// toutes disciplines confondues si sport non précisé. Le regroupement par jour se fait côté
+// client (plus simple, et le fuseau horaire de l'utilisateur est le bon référentiel pour
+// décider à quel "jour" appartient une vérification proche de minuit).
+/* ================================================================
+   COMBINÉS COMMUNAUTÉ PAR CATÉGORIE DE RISQUE (nouveau) — un combiné
+   par jour et par niveau (faible/modéré/élevé), construit à partir des
+   analyses publiées ce jour-là. Une fois généré, l'ensemble des legs
+   ne change plus (stabilité nécessaire : un combiné doit pouvoir être
+   déclaré "perdu" au sens propre si une seule des jambes échoue,
+   exactement comme un vrai pari combiné chez un bookmaker).
+================================================================= */
+const COMBO_RISK_BANDS = {
+  faible: { legsWanted: 4, filter: b => b.p >= 0.82 },
+  modere: { legsWanted: 3, filter: b => b.p >= 0.50 && b.p <= 0.80 && !(marketTypeFromEval(b.eval) === 'over_under' && b.p > 0.85) },
+  eleve: { legsWanted: 3, filter: b => (b.edge != null && b.edge > 0) || b.p < 0.50 },
+};
+
+async function getOrCreateDailyCombos(day, sport) {
+  const existing = await comboStore.listForDay(day, sport);
+  if (existing.length >= Object.keys(COMBO_RISK_BANDS).length) return existing;
+  const already = new Set(existing.map(c => c.riskLevel));
+
+  const dayStart = new Date(day + 'T00:00:00').getTime();
+  const dayEnd = dayStart + 86400000;
+  const published = await communityStore.listPublishedInRange(sport, dayStart, dayEnd, 200);
+
+  const created = [];
+  for (const [riskLevel, cfg] of Object.entries(COMBO_RISK_BANDS)) {
+    if (already.has(riskLevel)) continue;
+    // Un seul pari par match dans le combiné (matches distincts uniquement) — sinon deux
+    // jambes du même match seraient statistiquement liées, ce qui fausse la cote combinée.
+    const candidates = published.map(r => {
+      const eligible = (r.bets || []).filter(cfg.filter);
+      if (!eligible.length) return null;
+      const bet = eligible.slice().sort((a, b) => b.p - a.p)[0];
+      return { analysisId: r.id, nameA: r.nameA, nameB: r.nameB, label: bet.label, p: bet.p, marketType: marketTypeFromEval(bet.eval) };
+    }).filter(Boolean);
+    if (candidates.length < 2) continue; // pas assez de matchs publiés ce jour-là pour ce niveau
+    const legs = candidates.slice(0, cfg.legsWanted);
+    const combinedP = legs.reduce((acc, l) => acc * l.p, 1);
+    const combinedOdds = legs.reduce((acc, l) => acc * (1 / l.p), 1);
+    const combo = { id: crypto.randomUUID(), day, sport, riskLevel, legs, combinedP, combinedOdds, createdAt: Date.now() };
+    await comboStore.save(combo);
+    created.push(combo);
+  }
+  return [...existing, ...created];
+}
+
+// Statut calculé À LA VOLÉE (jamais stocké) : reflète toujours l'état de vérification le
+// plus récent de chaque jambe. Comme un vrai combiné : une seule jambe perdue suffit à
+// faire perdre l'ensemble, même si les autres jambes n'ont pas encore de résultat.
+async function computeComboStatus(combo) {
+  let allVerified = true, anyLost = false;
+  const legs = [];
+  for (const leg of combo.legs) {
+    const analysis = await communityStore.getById(leg.analysisId);
+    if (!analysis || !analysis.verifiedAt) { allVerified = false; legs.push({ ...leg, status: 'pending' }); continue; }
+    const evalMatch = (analysis.evaluations || []).find(e => e.label === leg.label);
+    const hit = evalMatch ? evalMatch.hit : null;
+    if (hit === false) anyLost = true;
+    legs.push({ ...leg, status: hit === true ? 'hit' : hit === false ? 'miss' : 'pending', finalScore: analysis.finalScore });
+  }
+  const status = anyLost ? 'perdu' : (allVerified ? 'gagne' : 'en_cours');
+  return { ...combo, legs, status };
+}
+
+async function handleCommunityCombos(req, res, query) {
+  const user = await verifyAuth(query.phone, query.token);
+  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(query.day || '') ? query.day : isoDate(new Date());
+  const sport = query.sport === 'basketball' ? 'basketball' : 'football';
+  try {
+    const combos = await getOrCreateDailyCombos(day, sport);
+    const withStatus = await Promise.all(combos.map(computeComboStatus));
+    sendJSON(res, 200, { day, sport, combos: withStatus });
+  } catch (e) {
+    console.error('[combos]', e.message);
+    sendJSON(res, 200, { day, sport, combos: [] });
+  }
+}
+
+async function handleCommunityHistory(req, res, query) {
+  const user = await verifyAuth(query.phone, query.token);
+  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
+  const sinceMs = Date.now() - COMMUNITY_HISTORY_WINDOW_DAYS * 86400000;
+  try {
+    const sports = query.sport === 'football' || query.sport === 'basketball' ? [query.sport] : ['football', 'basketball'];
+    const results = (await Promise.all(sports.map(sp => communityStore.listVerifiedFull(sp, sinceMs, 500)))).flat();
+    results.sort((a, b) => b.verifiedAt - a.verifiedAt);
+    sendJSON(res, 200, { results, windowDays: COMMUNITY_HISTORY_WINDOW_DAYS });
+  } catch (e) {
+    console.error('[community-history]', e.message);
+    sendJSON(res, 200, { results: [], windowDays: COMMUNITY_HISTORY_WINDOW_DAYS });
+  }
+}
+
+// "Mur des scores exacts" (nouveau) : uniquement les entrées où le score exact validé
+// correspond PILE à ce que l'appli avait annoncé (marketType score_exact, hit===true) —
+// même fenêtre de 20 jours, toutes disciplines.
+async function handleCommunityExactScoreWins(req, res, query) {
+  const user = await verifyAuth(query.phone, query.token);
+  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
+  const sinceMs = Date.now() - COMMUNITY_HISTORY_WINDOW_DAYS * 86400000;
+  try {
+    const sports = query.sport === 'football' || query.sport === 'basketball' ? [query.sport] : ['football', 'basketball'];
+    const all = (await Promise.all(sports.map(sp => communityStore.listVerifiedFull(sp, sinceMs, 500)))).flat();
+    const wins = all.filter(r => (r.evaluations || []).some(e => e.marketType === 'score_exact' && e.hit === true))
+      .map(r => ({
+        nameA: r.nameA, nameB: r.nameB, sport: r.sport, league: r.league, authorPseudo: r.authorPseudo,
+        finalScore: r.finalScore, verifiedAt: r.verifiedAt,
+        scoreLabel: (r.evaluations.find(e => e.marketType === 'score_exact' && e.hit === true) || {}).label || null,
+      }));
+    wins.sort((a, b) => b.verifiedAt - a.verifiedAt);
+    sendJSON(res, 200, { results: wins, windowDays: COMMUNITY_HISTORY_WINDOW_DAYS });
+  } catch (e) {
+    console.error('[community-exact-wins]', e.message);
+    sendJSON(res, 200, { results: [], windowDays: COMMUNITY_HISTORY_WINDOW_DAYS });
+  }
+}
+
 async function handlePublicStats(req, res) {
   try {
     const [fb, bk] = await Promise.all([
@@ -1472,6 +1653,9 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/community/verify' && req.method === 'POST') return await handleCommunityVerify(req, res);
     if (p === '/api/leaderboard' && req.method === 'GET') return await handleLeaderboard(req, res, parsed.query);
     if (p === '/api/public-stats' && req.method === 'GET') return await handlePublicStats(req, res);
+    if (p === '/api/community/history' && req.method === 'GET') return await handleCommunityHistory(req, res, parsed.query);
+    if (p === '/api/community/exact-score-wins' && req.method === 'GET') return await handleCommunityExactScoreWins(req, res, parsed.query);
+    if (p === '/api/community/combos' && req.method === 'GET') return await handleCommunityCombos(req, res, parsed.query);
     if (p === '/api/streak-checkin' && req.method === 'POST') return await handleStreakCheckin(req, res);
     if (p === '/api/pseudo' && req.method === 'POST') return await handleSetPseudo(req, res);
     sendJSON(res, 404, { error: 'Route inconnue.' });
