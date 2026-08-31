@@ -1450,9 +1450,9 @@ const COMMUNITY_HISTORY_WINDOW_DAYS = 20;
    exactement comme un vrai pari combiné chez un bookmaker).
 ================================================================= */
 const COMBO_RISK_BANDS = {
-  faible: { legsWanted: 4, filter: b => b.p >= 0.82 },
-  modere: { legsWanted: 3, filter: b => b.p >= 0.50 && b.p <= 0.80 },
-  eleve: { legsWanted: 3, filter: b => (b.edge != null && b.edge > 0) || b.p < 0.50 },
+  faible: { legsWanted: 4, filter: b => b.p >= 0.75 },
+  modere: { legsWanted: 3, filter: b => b.p >= 0.55 && b.p < 0.75 },
+  eleve: { legsWanted: 3, filter: b => b.p < 0.55 },
 };
 
 async function getOrCreateDailyCombos(day, sport) {
