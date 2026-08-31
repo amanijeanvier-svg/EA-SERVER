@@ -1451,7 +1451,7 @@ const COMMUNITY_HISTORY_WINDOW_DAYS = 20;
 ================================================================= */
 const COMBO_RISK_BANDS = {
   faible: { legsWanted: 4, filter: b => b.p >= 0.82 },
-  modere: { legsWanted: 3, filter: b => b.p >= 0.50 && b.p <= 0.80 && !(marketTypeFromEval(b.eval) === 'over_under' && b.p > 0.85) },
+  modere: { legsWanted: 3, filter: b => b.p >= 0.50 && b.p <= 0.80 },
   eleve: { legsWanted: 3, filter: b => (b.edge != null && b.edge > 0) || b.p < 0.50 },
 };
 
@@ -1469,14 +1469,39 @@ async function getOrCreateDailyCombos(day, sport) {
     if (already.has(riskLevel)) continue;
     // Un seul pari par match dans le combiné (matches distincts uniquement) — sinon deux
     // jambes du même match seraient statistiquement liées, ce qui fausse la cote combinée.
-    const candidates = published.map(r => {
+    // Pour CHAQUE match, on garde tous les paris éligibles (pas juste le plus probable)
+    // afin de pouvoir ensuite diversifier les types de marché sur l'ensemble du combiné —
+    // sans ça, "Plus de 1.5 buts" (presque toujours la probabilité la plus haute, tous
+    // matchs confondus) écrase systématiquement tous les autres types de paris.
+    const perMatch = published.map(r => {
       const eligible = (r.bets || []).filter(cfg.filter);
       if (!eligible.length) return null;
-      const bet = eligible.slice().sort((a, b) => b.p - a.p)[0];
-      return { analysisId: r.id, nameA: r.nameA, nameB: r.nameB, label: bet.label, p: bet.p, marketType: marketTypeFromEval(bet.eval) };
+      const options = eligible.slice().sort((a, b) => b.p - a.p)
+        .map(bet => ({ analysisId: r.id, nameA: r.nameA, nameB: r.nameB, label: bet.label, p: bet.p, marketType: marketTypeFromEval(bet.eval) }));
+      return options;
     }).filter(Boolean);
-    if (candidates.length < 2) continue; // pas assez de matchs publiés ce jour-là pour ce niveau
-    const legs = candidates.slice(0, cfg.legsWanted);
+    if (perMatch.length < 2) continue; // pas assez de matchs publiés ce jour-là pour ce niveau
+
+    // Sélection diversifiée : on parcourt les matchs en boucle, en prenant à chaque tour
+    // le meilleur pari de CHAQUE match qui n'a pas encore de type de marché représenté
+    // dans le combiné (repli sur le meilleur pari tout court seulement si tous les types
+    // disponibles pour ce match sont déjà représentés).
+    const legs = [];
+    const usedMarketTypes = new Set();
+    const matchPointers = perMatch.map(() => 0); // index du prochain pari à considérer pour ce match
+    let round = 0;
+    while (legs.length < cfg.legsWanted && round < perMatch.length * 3) {
+      const matchIdx = round % perMatch.length;
+      const options = perMatch[matchIdx];
+      if (legs.some(l => l.analysisId === options[0]?.analysisId)) { round++; continue; } // ce match a déjà une jambe
+      let chosen = options.find(o => !usedMarketTypes.has(o.marketType)) || options[matchPointers[matchIdx]] || options[0];
+      if (chosen) {
+        legs.push(chosen);
+        usedMarketTypes.add(chosen.marketType);
+      }
+      round++;
+    }
+    if (legs.length < 2) continue;
     const combinedP = legs.reduce((acc, l) => acc * l.p, 1);
     const combinedOdds = legs.reduce((acc, l) => acc * (1 / l.p), 1);
     const combo = { id: crypto.randomUUID(), day, sport, riskLevel, legs, combinedP, combinedOdds, createdAt: Date.now() };
