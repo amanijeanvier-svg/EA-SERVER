@@ -1276,8 +1276,8 @@ async function handleCommunitySearch(req, res, query) {
    dépasser un pari à pourcentage plus haut mais sans conviction contextuelle. Un plancher de
    probabilité évite malgré tout de faire remonter un pari trop incertain (un coup de pile ou
    face bien commenté reste un coup de pile ou face). */
-const COMM_BEST_MIN_P = 0.50; // plancher : zone "modérée à élevée", jamais un quasi coin-flip
-const COMM_BEST_MAX_P = 0.80; // plafond (hors paris rentables) : au-delà, la cote bookmaker n'a plus grand intérêt réel
+const COMM_BEST_MIN_P = 0.55; // plancher : zone "modérée à élevée", jamais un quasi coin-flip
+const COMM_BEST_MAX_P = 0.75; // plafond (hors paris rentables) : au-delà, la cote bookmaker n'a plus grand intérêt réel
 const COMM_OVERUNDER_MAX_P = 0.85; // un over/under au-delà reste à sa place dans Safe Bets, jamais dans Meilleurs Paris
 const COMM_FAVORED_MARKETS = new Set(['score_exact', 'btts', 'double_chance', '1x2']); // cotes structurellement plus intéressantes qu'un over/under
 const COMM_FAVORED_MARKET_BONUS = 1.15;
@@ -1360,7 +1360,15 @@ async function handleCommunityFeed(req, res, query) {
   const sport = query.sport === 'basketball' ? 'basketball' : 'football';
   const sub = query.sub || 'all'; // best | safe | value | score | all
   const page = Math.max(0, parseInt(query.page, 10) || 0);
-  let results = await communityStore.feed(sport, page, PAGE_SIZE * 5); // sur-échantillonne puis filtre côté serveur
+  // Filtre par jour de publication (nouveau) : "Aujourd'hui" ou une date YYYY-MM-DD parmi
+  // les 20 derniers jours — permet de parcourir Communauté comme un journal, jour par jour.
+  let results;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(query.day || '')) {
+    const dayStart = new Date(query.day + 'T00:00:00').getTime();
+    results = await communityStore.listPublishedInRange(sport, dayStart, dayStart + 86400000, 500);
+  } else {
+    results = await communityStore.feed(sport, page, PAGE_SIZE * 5); // sur-échantillonne puis filtre côté serveur
+  }
 
   if (sub === 'best') {
     results = await selectTopCommunityBets(sport, results, PAGE_SIZE);
@@ -1462,7 +1470,12 @@ async function getOrCreateDailyCombos(day, sport) {
 
   const dayStart = new Date(day + 'T00:00:00').getTime();
   const dayEnd = dayStart + 86400000;
-  const published = await communityStore.listPublishedInRange(sport, dayStart, dayEnd, 200);
+  // Fenêtre élargie à 48h (jour choisi + veille) : avec encore peu de publications
+  // communauté par jour, se limiter au seul calendrier strict laisse trop souvent moins
+  // de 2 matchs par niveau de risque, et aucun combiné ne peut se former. Le combiné reste
+  // rattaché à "day" pour la mise en cache/stabilité, seul le VIVIER de matchs candidats
+  // s'élargit.
+  const published = await communityStore.listPublishedInRange(sport, dayStart - 86400000, dayEnd, 200);
 
   const created = [];
   for (const [riskLevel, cfg] of Object.entries(COMBO_RISK_BANDS)) {
