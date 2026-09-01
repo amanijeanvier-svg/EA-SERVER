@@ -536,6 +536,10 @@ if (USE_SUPABASE) {
       const r = await fetch(`${REST}/community_combos`, { method: 'POST', headers: { ...HEADERS, 'Prefer': 'resolution=merge-duplicates' }, body: JSON.stringify(row) });
       if (!r.ok) throw new Error(`Supabase comboStore.save: ${r.status} ${await r.text()}`);
     },
+    async deleteById(id) {
+      const r = await fetch(`${REST}/community_combos?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', headers: HEADERS });
+      if (!r.ok) throw new Error(`Supabase comboStore.deleteById: ${r.status} ${await r.text()}`);
+    },
   };
 } else {
   console.warn('[DB] Mode fichier local (SUPABASE_URL/SUPABASE_SERVICE_KEY non configurés).');
@@ -647,6 +651,10 @@ if (USE_SUPABASE) {
     },
     async save(combo) {
       db.combos.push(combo);
+      await saveDB();
+    },
+    async deleteById(id) {
+      db.combos = db.combos.filter(c => c.id !== id);
       await saveDB();
     },
   };
@@ -1252,6 +1260,7 @@ async function handleCommunityPublish(req, res) {
   });
   await store.incrementUserStats(user.phone, { xpDelta: XP_PUBLISH, analysesDelta: 1 });
   notifyCommunityPublish(nameA, nameB, user.phone); // best-effort, ne bloque pas la réponse
+  refreshDailyCombos(isoDate(new Date()), sport).catch(e => console.error('[combos] refresh après publication:', e.message)); // idem
   sendJSON(res, 200, { ok: true, analysis: row, xpEarned: XP_PUBLISH });
 }
 
@@ -1522,6 +1531,27 @@ async function getOrCreateDailyCombos(day, sport) {
     created.push(combo);
   }
   return [...existing, ...created];
+}
+
+// Rafraîchissement déclenché à chaque publication communauté (nouveau) — sans ça, un
+// combiné du jour se figeait dès sa première génération (au premier passage d'un client
+// sur l'onglet Combinés) et un pari publié ensuite, même mieux placé dans la marge de
+// probabilité d'un niveau de risque, n'était jamais repris. On ne régénère QUE les
+// combinés dont aucune jambe n'a encore de résultat connu : dès qu'une jambe est vérifiée
+// (gagnée ou perdue), le combiné est un pari qui aurait déjà été "joué" dans la vraie vie —
+// on ne réécrit jamais son contenu après coup, seulement les combinés encore entièrement
+// en attente sont reconstruits avec le vivier de paris le plus à jour.
+async function refreshDailyCombos(day, sport) {
+  const existing = await comboStore.listForDay(day, sport);
+  let anyReset = false;
+  for (const combo of existing) {
+    const withStatus = await computeComboStatus(combo);
+    const hasKnownResult = withStatus.legs.some(l => l.status === 'hit' || l.status === 'miss');
+    if (!hasKnownResult) { await comboStore.deleteById(combo.id); anyReset = true; }
+  }
+  if (anyReset || existing.length < Object.keys(COMBO_RISK_BANDS).length) {
+    await getOrCreateDailyCombos(day, sport);
+  }
 }
 
 // Statut calculé À LA VOLÉE (jamais stocké) : reflète toujours l'état de vérification le
