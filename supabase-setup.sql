@@ -141,7 +141,10 @@ grant all on public.push_subscriptions to service_role;
 alter table public.users add column if not exists streak integer not null default 0;
 alter table public.users add column if not exists last_checkin_date text;
 
--- Combinés générés automatiquement par la Communauté, par jour et par catégorie de risque.
+-- DÉPRÉCIÉ : les combinés ne sont plus générés côté Communauté (déplacés côté client,
+-- construits en privé depuis vos propres analyses du jour). Cette table n'est plus lue ni
+-- écrite par le serveur — laissée en place uniquement pour ne pas casser une base existante ;
+-- tu peux la supprimer manuellement si tu veux faire du ménage : drop table if exists public.community_combos;
 create table if not exists public.community_combos (
   id text primary key,
   day text not null,

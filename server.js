@@ -299,7 +299,7 @@ let store;
 let trackStore;
 let communityStore;
 let pushStore;
-let comboStore;
+let comboStore; // conservé pour compat descendante mais plus utilisé (combinés déplacés côté client, voir 1.x)
 
 if (USE_SUPABASE) {
   console.log('[DB] Mode Supabase actif — les données sont persistantes.');
@@ -519,28 +519,6 @@ if (USE_SUPABASE) {
       return rows.map(row => ({ phone: row.phone, endpoint: row.endpoint, p256dh: row.p256dh, auth: row.auth }));
     },
   };
-
-  // Combinés générés automatiquement par la Communauté, par jour et par catégorie de risque
-  // (nouveau) — une fois créés pour un jour donné, les legs ne bougent plus (stabilité
-  // nécessaire pour qu'un combiné puisse être "perdu" au sens propre).
-  comboStore = {
-    async listForDay(day, sport) {
-      const filter = `and=(day.eq.${day},sport.eq.${sport})`;
-      const r = await fetch(`${REST}/community_combos?${filter}&select=*`, { headers: HEADERS });
-      if (!r.ok) throw new Error(`Supabase comboStore.listForDay: ${r.status} ${await r.text()}`);
-      const rows = await r.json();
-      return rows.map(row => ({ id: row.id, day: row.day, sport: row.sport, riskLevel: row.risk_level, legs: row.legs, combinedP: row.combined_p, combinedOdds: row.combined_odds, createdAt: row.created_at }));
-    },
-    async save(combo) {
-      const row = { id: combo.id, day: combo.day, sport: combo.sport, risk_level: combo.riskLevel, legs: combo.legs, combined_p: combo.combinedP, combined_odds: combo.combinedOdds, created_at: combo.createdAt };
-      const r = await fetch(`${REST}/community_combos`, { method: 'POST', headers: { ...HEADERS, 'Prefer': 'resolution=merge-duplicates' }, body: JSON.stringify(row) });
-      if (!r.ok) throw new Error(`Supabase comboStore.save: ${r.status} ${await r.text()}`);
-    },
-    async deleteById(id) {
-      const r = await fetch(`${REST}/community_combos?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE', headers: HEADERS });
-      if (!r.ok) throw new Error(`Supabase comboStore.deleteById: ${r.status} ${await r.text()}`);
-    },
-  };
 } else {
   console.warn('[DB] Mode fichier local (SUPABASE_URL/SUPABASE_SERVICE_KEY non configurés).');
   console.warn('[DB] ATTENTION : sur le plan gratuit Render, ces données seront PERDUES au prochain redéploiement. Voir README.md.');
@@ -642,21 +620,6 @@ if (USE_SUPABASE) {
       await saveDB();
     },
     async listSubscriptions() { return db.pushSubscriptions; },
-  };
-
-  if (!db.combos) db.combos = [];
-  comboStore = {
-    async listForDay(day, sport) {
-      return db.combos.filter(c => c.day === day && c.sport === sport);
-    },
-    async save(combo) {
-      db.combos.push(combo);
-      await saveDB();
-    },
-    async deleteById(id) {
-      db.combos = db.combos.filter(c => c.id !== id);
-      await saveDB();
-    },
   };
 }
 
@@ -1260,7 +1223,6 @@ async function handleCommunityPublish(req, res) {
   });
   await store.incrementUserStats(user.phone, { xpDelta: XP_PUBLISH, analysesDelta: 1 });
   notifyCommunityPublish(nameA, nameB, user.phone); // best-effort, ne bloque pas la réponse
-  refreshDailyCombos(isoDate(new Date()), sport).catch(e => console.error('[combos] refresh après publication:', e.message)); // idem
   sendJSON(res, 200, { ok: true, analysis: row, xpEarned: XP_PUBLISH });
 }
 
@@ -1286,7 +1248,7 @@ async function handleCommunitySearch(req, res, query) {
    probabilité évite malgré tout de faire remonter un pari trop incertain (un coup de pile ou
    face bien commenté reste un coup de pile ou face). */
 const COMM_BEST_MIN_P = 0.55; // plancher : zone "modérée à élevée", jamais un quasi coin-flip
-const COMM_BEST_MAX_P = 0.75; // plafond (hors paris rentables) : au-delà, la cote bookmaker n'a plus grand intérêt réel
+const COMM_BEST_MAX_P = 0.80; // plafond (hors paris rentables) : au-delà, la cote bookmaker n'a plus grand intérêt réel
 const COMM_OVERUNDER_MAX_P = 0.85; // un over/under au-delà reste à sa place dans Safe Bets, jamais dans Meilleurs Paris
 const COMM_FAVORED_MARKETS = new Set(['score_exact', 'btts', 'double_chance', '1x2']); // cotes structurellement plus intéressantes qu'un over/under
 const COMM_FAVORED_MARKET_BONUS = 1.15;
@@ -1302,6 +1264,66 @@ async function getCommunityReliability(sport) {
   const data = computeCalibrationByMarket(verified) || {};
   communityReliabilityCache.set(sport, { at: Date.now(), data });
   return data;
+}
+
+/* ================================================================
+   MOYENNES PAR LIGUE (nouveau, football uniquement pour l'instant) —
+   construites à partir de TOUTES les analyses communauté déjà vérifiées
+   (score final connu), tous utilisateurs confondus : dès qu'assez de
+   matchs d'une ligue ont été vérifiés par n'importe qui, tout le monde
+   en bénéficie. Ce qu'on retient par ligue : buts moyens marqués à
+   domicile / à l'extérieur, % victoire domicile / extérieur / nul.
+   Les buts ENCAISSÉS ne sont jamais stockés séparément : dans une ligue,
+   ce que l'équipe à domicile encaisse EST exactement ce que l'équipe à
+   l'extérieur marque en moyenne (et inversement) — ce sont les deux
+   mêmes chiffres, pas besoin de les compter deux fois.
+================================================================= */
+const LEAGUE_STATS_MIN_N = 8; // en dessous, la moyenne est trop bruitée pour influencer quoi que ce soit
+const leagueStatsCache = new Map(); // sport -> {at, data}
+const LEAGUE_STATS_TTL = 15 * 60 * 1000;
+
+async function getLeagueStats(sport) {
+  const cached = leagueStatsCache.get(sport);
+  if (cached && Date.now() - cached.at < LEAGUE_STATS_TTL) return cached.data;
+  const verified = await communityStore.listVerifiedFull(sport, 0, 5000);
+  const byLeague = {};
+  for (const r of verified) {
+    const league = (r.league || '').trim();
+    if (!league || !r.finalScore || r.finalScore.a == null || r.finalScore.b == null) continue;
+    if (!byLeague[league]) byLeague[league] = { homeGoals: 0, awayGoals: 0, homeWins: 0, awayWins: 0, draws: 0, n: 0 };
+    const s = byLeague[league];
+    const a = r.finalScore.a, b = r.finalScore.b;
+    s.homeGoals += a; s.awayGoals += b; s.n++;
+    if (a > b) s.homeWins++; else if (b > a) s.awayWins++; else s.draws++;
+  }
+  const data = {};
+  for (const [league, s] of Object.entries(byLeague)) {
+    if (s.n < LEAGUE_STATS_MIN_N) continue; // pas assez de matchs vérifiés : on ne publie rien pour cette ligue plutôt qu'une moyenne peu fiable
+    data[league] = {
+      avgHomeGoals: +(s.homeGoals / s.n).toFixed(2),
+      avgAwayGoals: +(s.awayGoals / s.n).toFixed(2),
+      homeWinPct: +(s.homeWins / s.n).toFixed(3),
+      awayWinPct: +(s.awayWins / s.n).toFixed(3),
+      drawPct: +(s.draws / s.n).toFixed(3),
+      n: s.n,
+    };
+  }
+  leagueStatsCache.set(sport, { at: Date.now(), data });
+  return data;
+}
+
+async function handleLeagueStats(req, res, query) {
+  const user = await verifyAuth(query.phone, query.token);
+  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
+  const sport = query.sport === 'basketball' ? 'basketball' : 'football';
+  try {
+    const all = await getLeagueStats(sport);
+    if (query.league) return sendJSON(res, 200, { league: query.league, stats: all[(query.league || '').trim()] || null });
+    sendJSON(res, 200, { leagues: all });
+  } catch (e) {
+    console.error('[league-stats]', e.message);
+    sendJSON(res, 200, { leagues: {} });
+  }
 }
 
 function pickBestBet(analysis) {
@@ -1363,6 +1385,51 @@ async function selectTopCommunityBets(sport, candidates, limit) {
   return result.map(item => ({ ...item.analysis, headlineBet: item.bet, reliabilityFactor: item.reliabilityFactor, reliabilityN: item.reliabilityN, convictionIdx: item.convictionIdx, rentable: item.rentable }));
 }
 
+async function filterCommunityBySub(sport, results, sub, limitForBest) {
+  if (sub === 'best') {
+    return await selectTopCommunityBets(sport, results, limitForBest);
+  }
+  if (sub === 'safe') {
+    return results.filter(r => (r.bets || []).some(b => b.p >= 0.82));
+  }
+  if (sub === 'value') {
+    // La carte doit montrer LE pari qui a la meilleure valeur réelle (edge), pas le plus probable :
+    // un pari à 56% avec un edge de +76% est plus intéressant qu'un pari à 90% sans edge positif.
+    return results
+      .map(r => {
+        const valueBets = (r.bets || []).filter(b => b.edge != null && b.edge > 0);
+        if (!valueBets.length) return null;
+        const bestValueBet = valueBets.slice().sort((a, b) => b.edge - a.edge)[0];
+        return { ...r, headlineBet: bestValueBet };
+      })
+      .filter(Boolean);
+  }
+  if (sub === 'score') {
+    // Idem : on met en avant le meilleur score exact (topScores), pas un pari classique.
+    // Le seuil de 15% ne s'applique pas à la probabilité brute mais à une probabilité
+    // corrigée par la fiabilité réelle mesurée sur l'historique communautaire vérifié pour
+    // ce marché : si les scores exacts de la communauté sortent historiquement plus souvent
+    // que le modèle ne l'annonce, un score estimé un peu en dessous de 15% peut légitimement
+    // passer. La correction reste prudente (plafonnée à ±10-35%, comme le reste du système
+    // de recalibration de l'appli) pour ne jamais extrapoler au-delà de ce que l'historique
+    // permet réellement d'affirmer.
+    const reliability = await getCommunityReliability(sport);
+    const scoreCal = reliability['score_exact'];
+    const calFactor = (scoreCal && scoreCal.n >= COMM_RELIABILITY_MIN_N && scoreCal.avgP > 0)
+      ? Math.max(0.65, Math.min(1.10, scoreCal.hitRate / scoreCal.avgP)) : 1;
+    return results
+      .map(r => {
+        const scored = (r.topScores || []).map(s => ({ ...s, correctedP: s.p * calFactor }));
+        const eligible = scored.filter(s => s.correctedP >= 0.15);
+        if (!eligible.length) return null;
+        const bestScore = eligible.slice().sort((a, b) => b.correctedP - a.correctedP)[0];
+        return { ...r, headlineBet: { label: bestScore.label, p: bestScore.p, marketType: 'score_exact' } };
+      })
+      .filter(Boolean);
+  }
+  return results; // sub === 'all' : historique brut, sans filtre
+}
+
 async function handleCommunityFeed(req, res, query) {
   const user = await verifyAuth(query.phone, query.token);
   if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
@@ -1379,48 +1446,34 @@ async function handleCommunityFeed(req, res, query) {
     results = await communityStore.feed(sport, page, PAGE_SIZE * 5); // sur-échantillonne puis filtre côté serveur
   }
 
-  if (sub === 'best') {
-    results = await selectTopCommunityBets(sport, results, PAGE_SIZE);
-    return sendJSON(res, 200, { results, page, perPage: PAGE_SIZE });
-  }
-  if (sub === 'safe') {
-    results = results.filter(r => (r.bets || []).some(b => b.p >= 0.82));
-  } else if (sub === 'value') {
-    // La carte doit montrer LE pari qui a la meilleure valeur réelle (edge), pas le plus probable :
-    // un pari à 56% avec un edge de +76% est plus intéressant qu'un pari à 90% sans edge positif.
-    results = results
-      .map(r => {
-        const valueBets = (r.bets || []).filter(b => b.edge != null && b.edge > 0);
-        if (!valueBets.length) return null;
-        const bestValueBet = valueBets.slice().sort((a, b) => b.edge - a.edge)[0];
-        return { ...r, headlineBet: bestValueBet };
-      })
-      .filter(Boolean);
-  } else if (sub === 'score') {
-    // Idem : on met en avant le meilleur score exact (topScores), pas un pari classique.
-    // Le seuil de 15% ne s'applique pas à la probabilité brute mais à une probabilité
-    // corrigée par la fiabilité réelle mesurée sur l'historique communautaire vérifié pour
-    // ce marché : si les scores exacts de la communauté sortent historiquement plus souvent
-    // que le modèle ne l'annonce, un score estimé un peu en dessous de 15% peut légitimement
-    // passer. La correction reste prudente (plafonnée à ±10-35%, comme le reste du système
-    // de recalibration de l'appli) pour ne jamais extrapoler au-delà de ce que l'historique
-    // permet réellement d'affirmer.
-    const reliability = await getCommunityReliability(sport);
-    const scoreCal = reliability['score_exact'];
-    const calFactor = (scoreCal && scoreCal.n >= COMM_RELIABILITY_MIN_N && scoreCal.avgP > 0)
-      ? Math.max(0.65, Math.min(1.10, scoreCal.hitRate / scoreCal.avgP)) : 1;
-    results = results
-      .map(r => {
-        const scored = (r.topScores || []).map(s => ({ ...s, correctedP: s.p * calFactor }));
-        const eligible = scored.filter(s => s.correctedP >= 0.15);
-        if (!eligible.length) return null;
-        const bestScore = eligible.slice().sort((a, b) => b.correctedP - a.correctedP)[0];
-        return { ...r, headlineBet: { label: bestScore.label, p: bestScore.p, marketType: 'score_exact' } };
-      })
-      .filter(Boolean);
-  }
+  results = await filterCommunityBySub(sport, results, sub, PAGE_SIZE);
+  if (sub === 'best') return sendJSON(res, 200, { results, page, perPage: PAGE_SIZE });
   sendJSON(res, 200, { results: results.slice(0, PAGE_SIZE), page, perPage: PAGE_SIZE });
 }
+
+// Calendrier basé sur la RÉALITÉ des publications (nouveau) : plutôt qu'un défilement de
+// 20 jours fixes (dont beaucoup vides selon le filtre choisi), on ne renvoie que les jours
+// où ce sous-onglet précis a effectivement du contenu — l'utilisateur navigue par jour de
+// publication réel, jamais par un calendrier générique aligné sur "aujourd'hui - N jours".
+const ACTIVE_DAYS_WINDOW_DAYS = 60;
+async function handleCommunityActiveDays(req, res, query) {
+  const user = await verifyAuth(query.phone, query.token);
+  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
+  const sport = query.sport === 'basketball' ? 'basketball' : 'football';
+  const sub = query.sub || 'all';
+  const sinceMs = Date.now() - ACTIVE_DAYS_WINDOW_DAYS * 86400000;
+  try {
+    const all = await communityStore.listPublishedInRange(sport, sinceMs, Date.now() + 86400000, 2000);
+    const filtered = await filterCommunityBySub(sport, all, sub, all.length);
+    const days = [...new Set(filtered.map(r => isoDate(new Date(r.timestamp))))].sort((a, b) => b.localeCompare(a));
+    sendJSON(res, 200, { days });
+  } catch (e) {
+    console.error('[community-active-days]', e.message);
+    sendJSON(res, 200, { days: [] });
+  }
+}
+
+
 
 async function handleCommunityVerify(req, res) {
   const body = await readBody(req);
@@ -1458,135 +1511,7 @@ const COMMUNITY_HISTORY_WINDOW_DAYS = 20;
 // toutes disciplines confondues si sport non précisé. Le regroupement par jour se fait côté
 // client (plus simple, et le fuseau horaire de l'utilisateur est le bon référentiel pour
 // décider à quel "jour" appartient une vérification proche de minuit).
-/* ================================================================
-   COMBINÉS COMMUNAUTÉ PAR CATÉGORIE DE RISQUE (nouveau) — un combiné
-   par jour et par niveau (faible/modéré/élevé), construit à partir des
-   analyses publiées ce jour-là. Une fois généré, l'ensemble des legs
-   ne change plus (stabilité nécessaire : un combiné doit pouvoir être
-   déclaré "perdu" au sens propre si une seule des jambes échoue,
-   exactement comme un vrai pari combiné chez un bookmaker).
-================================================================= */
-const COMBO_RISK_BANDS = {
-  faible: { legsWanted: 4, filter: b => b.p >= 0.75 },
-  modere: { legsWanted: 3, filter: b => b.p >= 0.55 && b.p < 0.75 },
-  eleve: { legsWanted: 3, filter: b => b.p < 0.55 },
-};
-
-async function getOrCreateDailyCombos(day, sport) {
-  const existing = await comboStore.listForDay(day, sport);
-  if (existing.length >= Object.keys(COMBO_RISK_BANDS).length) return existing;
-  const already = new Set(existing.map(c => c.riskLevel));
-
-  const dayStart = new Date(day + 'T00:00:00').getTime();
-  const dayEnd = dayStart + 86400000;
-  // Fenêtre élargie à 48h (jour choisi + veille) : avec encore peu de publications
-  // communauté par jour, se limiter au seul calendrier strict laisse trop souvent moins
-  // de 2 matchs par niveau de risque, et aucun combiné ne peut se former. Le combiné reste
-  // rattaché à "day" pour la mise en cache/stabilité, seul le VIVIER de matchs candidats
-  // s'élargit.
-  const published = await communityStore.listPublishedInRange(sport, dayStart - 86400000, dayEnd, 200);
-
-  const created = [];
-  for (const [riskLevel, cfg] of Object.entries(COMBO_RISK_BANDS)) {
-    if (already.has(riskLevel)) continue;
-    // Un seul pari par match dans le combiné (matches distincts uniquement) — sinon deux
-    // jambes du même match seraient statistiquement liées, ce qui fausse la cote combinée.
-    // Pour CHAQUE match, on garde tous les paris éligibles (pas juste le plus probable)
-    // afin de pouvoir ensuite diversifier les types de marché sur l'ensemble du combiné —
-    // sans ça, "Plus de 1.5 buts" (presque toujours la probabilité la plus haute, tous
-    // matchs confondus) écrase systématiquement tous les autres types de paris.
-    const perMatch = published.map(r => {
-      const eligible = (r.bets || []).filter(cfg.filter);
-      if (!eligible.length) return null;
-      const options = eligible.slice().sort((a, b) => b.p - a.p)
-        .map(bet => ({ analysisId: r.id, nameA: r.nameA, nameB: r.nameB, label: bet.label, p: bet.p, marketType: marketTypeFromEval(bet.eval) }));
-      return options;
-    }).filter(Boolean);
-    if (perMatch.length < 2) continue; // pas assez de matchs publiés ce jour-là pour ce niveau
-
-    // Sélection diversifiée : on parcourt les matchs en boucle, en prenant à chaque tour
-    // le meilleur pari de CHAQUE match qui n'a pas encore de type de marché représenté
-    // dans le combiné (repli sur le meilleur pari tout court seulement si tous les types
-    // disponibles pour ce match sont déjà représentés).
-    const legs = [];
-    const usedMarketTypes = new Set();
-    const matchPointers = perMatch.map(() => 0); // index du prochain pari à considérer pour ce match
-    let round = 0;
-    while (legs.length < cfg.legsWanted && round < perMatch.length * 3) {
-      const matchIdx = round % perMatch.length;
-      const options = perMatch[matchIdx];
-      if (legs.some(l => l.analysisId === options[0]?.analysisId)) { round++; continue; } // ce match a déjà une jambe
-      let chosen = options.find(o => !usedMarketTypes.has(o.marketType)) || options[matchPointers[matchIdx]] || options[0];
-      if (chosen) {
-        legs.push(chosen);
-        usedMarketTypes.add(chosen.marketType);
-      }
-      round++;
-    }
-    if (legs.length < 2) continue;
-    const combinedP = legs.reduce((acc, l) => acc * l.p, 1);
-    const combinedOdds = legs.reduce((acc, l) => acc * (1 / l.p), 1);
-    const combo = { id: crypto.randomUUID(), day, sport, riskLevel, legs, combinedP, combinedOdds, createdAt: Date.now() };
-    await comboStore.save(combo);
-    created.push(combo);
-  }
-  return [...existing, ...created];
-}
-
 // Rafraîchissement déclenché à chaque publication communauté (nouveau) — sans ça, un
-// combiné du jour se figeait dès sa première génération (au premier passage d'un client
-// sur l'onglet Combinés) et un pari publié ensuite, même mieux placé dans la marge de
-// probabilité d'un niveau de risque, n'était jamais repris. On ne régénère QUE les
-// combinés dont aucune jambe n'a encore de résultat connu : dès qu'une jambe est vérifiée
-// (gagnée ou perdue), le combiné est un pari qui aurait déjà été "joué" dans la vraie vie —
-// on ne réécrit jamais son contenu après coup, seulement les combinés encore entièrement
-// en attente sont reconstruits avec le vivier de paris le plus à jour.
-async function refreshDailyCombos(day, sport) {
-  const existing = await comboStore.listForDay(day, sport);
-  let anyReset = false;
-  for (const combo of existing) {
-    const withStatus = await computeComboStatus(combo);
-    const hasKnownResult = withStatus.legs.some(l => l.status === 'hit' || l.status === 'miss');
-    if (!hasKnownResult) { await comboStore.deleteById(combo.id); anyReset = true; }
-  }
-  if (anyReset || existing.length < Object.keys(COMBO_RISK_BANDS).length) {
-    await getOrCreateDailyCombos(day, sport);
-  }
-}
-
-// Statut calculé À LA VOLÉE (jamais stocké) : reflète toujours l'état de vérification le
-// plus récent de chaque jambe. Comme un vrai combiné : une seule jambe perdue suffit à
-// faire perdre l'ensemble, même si les autres jambes n'ont pas encore de résultat.
-async function computeComboStatus(combo) {
-  let allVerified = true, anyLost = false;
-  const legs = [];
-  for (const leg of combo.legs) {
-    const analysis = await communityStore.getById(leg.analysisId);
-    if (!analysis || !analysis.verifiedAt) { allVerified = false; legs.push({ ...leg, status: 'pending' }); continue; }
-    const evalMatch = (analysis.evaluations || []).find(e => e.label === leg.label);
-    const hit = evalMatch ? evalMatch.hit : null;
-    if (hit === false) anyLost = true;
-    legs.push({ ...leg, status: hit === true ? 'hit' : hit === false ? 'miss' : 'pending', finalScore: analysis.finalScore });
-  }
-  const status = anyLost ? 'perdu' : (allVerified ? 'gagne' : 'en_cours');
-  return { ...combo, legs, status };
-}
-
-async function handleCommunityCombos(req, res, query) {
-  const user = await verifyAuth(query.phone, query.token);
-  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
-  const day = /^\d{4}-\d{2}-\d{2}$/.test(query.day || '') ? query.day : isoDate(new Date());
-  const sport = query.sport === 'basketball' ? 'basketball' : 'football';
-  try {
-    const combos = await getOrCreateDailyCombos(day, sport);
-    const withStatus = await Promise.all(combos.map(computeComboStatus));
-    sendJSON(res, 200, { day, sport, combos: withStatus });
-  } catch (e) {
-    console.error('[combos]', e.message);
-    sendJSON(res, 200, { day, sport, combos: [] });
-  }
-}
-
 async function handleCommunityHistory(req, res, query) {
   const user = await verifyAuth(query.phone, query.token);
   if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
@@ -1723,7 +1648,8 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/public-stats' && req.method === 'GET') return await handlePublicStats(req, res);
     if (p === '/api/community/history' && req.method === 'GET') return await handleCommunityHistory(req, res, parsed.query);
     if (p === '/api/community/exact-score-wins' && req.method === 'GET') return await handleCommunityExactScoreWins(req, res, parsed.query);
-    if (p === '/api/community/combos' && req.method === 'GET') return await handleCommunityCombos(req, res, parsed.query);
+    if (p === '/api/community/active-days' && req.method === 'GET') return await handleCommunityActiveDays(req, res, parsed.query);
+    if (p === '/api/league-stats' && req.method === 'GET') return await handleLeagueStats(req, res, parsed.query);
     if (p === '/api/streak-checkin' && req.method === 'POST') return await handleStreakCheckin(req, res);
     if (p === '/api/pseudo' && req.method === 'POST') return await handleSetPseudo(req, res);
     sendJSON(res, 404, { error: 'Route inconnue.' });
