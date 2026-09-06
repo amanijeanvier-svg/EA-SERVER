@@ -159,3 +159,23 @@ create index if not exists community_combos_day_sport_idx on public.community_co
 
 alter table public.community_combos disable row level security;
 grant all on public.community_combos to service_role;
+
+-- ================================================================
+-- Contributions silencieuses aux moyennes par ligue (nouveau) — un score final + une ligue,
+-- envoyés depuis une analyse PRIVÉE (jamais publiée en communauté), pour que la moyenne
+-- commune par ligue en profite quand même. Jamais affiché nulle part comme un post, jamais
+-- lié à un pseudo visible.
+-- ================================================================
+
+create table if not exists public.league_contributions (
+  id bigint generated always as identity primary key,
+  sport text not null,
+  league text not null,
+  home_score integer not null,
+  away_score integer not null,
+  created_at bigint not null
+);
+create index if not exists league_contributions_sport_league_idx on public.league_contributions (sport, league);
+
+alter table public.league_contributions disable row level security;
+grant all on public.league_contributions to service_role;

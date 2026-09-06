@@ -300,6 +300,7 @@ let trackStore;
 let communityStore;
 let pushStore;
 let comboStore; // conservé pour compat descendante mais plus utilisé (combinés déplacés côté client, voir 1.x)
+let leagueContribStore;
 
 if (USE_SUPABASE) {
   console.log('[DB] Mode Supabase actif — les données sont persistantes.');
@@ -519,6 +520,23 @@ if (USE_SUPABASE) {
       return rows.map(row => ({ phone: row.phone, endpoint: row.endpoint, p256dh: row.p256dh, auth: row.auth }));
     },
   };
+
+  // Contributions silencieuses aux moyennes par ligue (nouveau) — juste sport/ligue/score,
+  // jamais liées à un auteur affiché : ça n'alimente qu'une moyenne, ça n'apparaît jamais
+  // dans un fil.
+  leagueContribStore = {
+    async add(entry) {
+      const row = { sport: entry.sport, league: entry.league, home_score: entry.homeScore, away_score: entry.awayScore, created_at: entry.createdAt };
+      const r = await fetch(`${REST}/league_contributions`, { method: 'POST', headers: HEADERS, body: JSON.stringify(row) });
+      if (!r.ok) throw new Error(`Supabase leagueContribStore.add: ${r.status} ${await r.text()}`);
+    },
+    async list(sport, limit = 5000) {
+      const r = await fetch(`${REST}/league_contributions?sport=eq.${encodeURIComponent(sport)}&select=league,home_score,away_score&limit=${limit}`, { headers: HEADERS });
+      if (!r.ok) throw new Error(`Supabase leagueContribStore.list: ${r.status} ${await r.text()}`);
+      const rows = await r.json();
+      return rows.map(row => ({ league: row.league, homeScore: row.home_score, awayScore: row.away_score }));
+    },
+  };
 } else {
   console.warn('[DB] Mode fichier local (SUPABASE_URL/SUPABASE_SERVICE_KEY non configurés).');
   console.warn('[DB] ATTENTION : sur le plan gratuit Render, ces données seront PERDUES au prochain redéploiement. Voir README.md.');
@@ -620,6 +638,14 @@ if (USE_SUPABASE) {
       await saveDB();
     },
     async listSubscriptions() { return db.pushSubscriptions; },
+  };
+
+  if (!db.leagueContributions) db.leagueContributions = [];
+  leagueContribStore = {
+    async add(entry) { db.leagueContributions.push(entry); await saveDB(); },
+    async list(sport, limit = 5000) {
+      return db.leagueContributions.filter(c => c.sport === sport).slice(-limit).map(c => ({ league: c.league, homeScore: c.homeScore, awayScore: c.awayScore }));
+    },
   };
 }
 
@@ -1296,6 +1322,20 @@ async function getLeagueStats(sport) {
     s.homeGoals += a; s.awayGoals += b; s.n++;
     if (a > b) s.homeWins++; else if (b > a) s.awayWins++; else s.draws++;
   }
+  // Contributions silencieuses (nouveau) : scores envoyés depuis des analyses PRIVÉES
+  // (jamais publiées en communauté) — comptées ici en plus, jamais en double avec les
+  // analyses communauté ci-dessus (le client n'envoie une contribution QUE pour les
+  // matchs qu'il n'a pas publiés).
+  const contributions = await leagueContribStore.list(sport, 5000);
+  for (const c of contributions) {
+    const league = (c.league || '').trim();
+    if (!league || c.homeScore == null || c.awayScore == null) continue;
+    if (!byLeague[league]) byLeague[league] = { homeGoals: 0, awayGoals: 0, homeWins: 0, awayWins: 0, draws: 0, n: 0 };
+    const s = byLeague[league];
+    const a = c.homeScore, b = c.awayScore;
+    s.homeGoals += a; s.awayGoals += b; s.n++;
+    if (a > b) s.homeWins++; else if (b > a) s.awayWins++; else s.draws++;
+  }
   const data = {};
   for (const [league, s] of Object.entries(byLeague)) {
     if (s.n < LEAGUE_STATS_MIN_N) continue; // pas assez de matchs vérifiés : on ne publie rien pour cette ligue plutôt qu'une moyenne peu fiable
@@ -1310,6 +1350,18 @@ async function getLeagueStats(sport) {
   }
   leagueStatsCache.set(sport, { at: Date.now(), data });
   return data;
+}
+
+async function handleLeagueContribute(req, res) {
+  const body = await readBody(req);
+  const user = await verifyAuth(body.phone, body.token);
+  if (!user) return sendJSON(res, 401, { error: 'Session invalide.' });
+  const sport = body.sport === 'basketball' ? 'basketball' : 'football';
+  const league = (body.league || '').trim();
+  const homeScore = Number(body.homeScore), awayScore = Number(body.awayScore);
+  if (!league || !Number.isFinite(homeScore) || !Number.isFinite(awayScore)) return sendJSON(res, 400, { error: 'league, homeScore et awayScore requis.' });
+  await leagueContribStore.add({ sport, league, homeScore, awayScore, createdAt: Date.now() });
+  sendJSON(res, 200, { ok: true });
 }
 
 async function handleLeagueStats(req, res, query) {
@@ -1650,6 +1702,7 @@ const server = http.createServer(async (req, res) => {
     if (p === '/api/community/exact-score-wins' && req.method === 'GET') return await handleCommunityExactScoreWins(req, res, parsed.query);
     if (p === '/api/community/active-days' && req.method === 'GET') return await handleCommunityActiveDays(req, res, parsed.query);
     if (p === '/api/league-stats' && req.method === 'GET') return await handleLeagueStats(req, res, parsed.query);
+    if (p === '/api/league-contribute' && req.method === 'POST') return await handleLeagueContribute(req, res);
     if (p === '/api/streak-checkin' && req.method === 'POST') return await handleStreakCheckin(req, res);
     if (p === '/api/pseudo' && req.method === 'POST') return await handleSetPseudo(req, res);
     sendJSON(res, 404, { error: 'Route inconnue.' });
